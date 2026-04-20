@@ -43,6 +43,7 @@ class BotStorage:
                     topic_id INTEGER NOT NULL,
                     reply_to_post_number INTEGER,
                     raw TEXT NOT NULL,
+                    gif_id TEXT,
                     decision_reason TEXT NOT NULL,
                     due_at TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -65,6 +66,7 @@ class BotStorage:
                     topic_id INTEGER,
                     reply_to_post_number INTEGER,
                     raw TEXT,
+                    gif_id TEXT,
                     ollama_reason TEXT,
                     due_at TEXT,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -82,6 +84,8 @@ class BotStorage:
                 ON manual_commands(status, due_at);
                 """
             )
+            _ensure_column(connection, "pending_replies", "gif_id", "TEXT")
+            _ensure_column(connection, "manual_commands", "gif_id", "TEXT")
 
     def is_handled(self, notification_id: int) -> bool:
         with self._session() as connection:
@@ -129,6 +133,7 @@ class BotStorage:
         due_at: str,
         created_at: str,
         presence_channel: str | None,
+        gif_id: str | None = None,
     ) -> bool:
         with self._session() as connection:
             cursor = connection.execute(
@@ -138,6 +143,7 @@ class BotStorage:
                     topic_id,
                     reply_to_post_number,
                     raw,
+                    gif_id,
                     decision_reason,
                     due_at,
                     attempts,
@@ -145,13 +151,14 @@ class BotStorage:
                     created_at,
                     presence_channel,
                     last_presence_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, NULL)
                 """,
                 (
                     notification_id,
                     topic_id,
                     reply_to_post_number,
                     raw,
+                    gif_id,
                     decision_reason,
                     due_at,
                     created_at,
@@ -296,6 +303,7 @@ class BotStorage:
         ollama_reason: str,
         due_at: str,
         presence_channel: str | None,
+        gif_id: str | None = None,
     ) -> None:
         with self._session() as connection:
             connection.execute(
@@ -305,6 +313,7 @@ class BotStorage:
                     topic_id = ?,
                     reply_to_post_number = ?,
                     raw = ?,
+                    gif_id = ?,
                     ollama_reason = ?,
                     due_at = ?,
                     attempts = 0,
@@ -317,6 +326,7 @@ class BotStorage:
                     topic_id,
                     reply_to_post_number,
                     raw,
+                    gif_id,
                     ollama_reason,
                     due_at,
                     presence_channel,
@@ -498,6 +508,7 @@ def _row_to_pending_job(row: sqlite3.Row) -> PendingJob:
         topic_id=int(row["topic_id"]),
         reply_to_post_number=row["reply_to_post_number"],
         raw=str(row["raw"]),
+        gif_id=row["gif_id"],
         decision_reason=str(row["decision_reason"]),
         due_at=str(row["due_at"]),
         attempts=int(row["attempts"]),
@@ -519,6 +530,7 @@ def _row_to_manual_command(row: sqlite3.Row) -> ManualCommand:
         topic_id=row["topic_id"],
         reply_to_post_number=row["reply_to_post_number"],
         raw=row["raw"],
+        gif_id=row["gif_id"],
         ollama_reason=row["ollama_reason"],
         due_at=row["due_at"],
         attempts=int(row["attempts"]),
@@ -535,3 +547,15 @@ def _scalar_int(connection: sqlite3.Connection, query: str) -> int:
     if row is None:
         return 0
     return int(row[0])
+
+
+def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name in columns:
+        return
+    connection.execute(
+        f"ALTER TABLE {table_name} ADD COLUMN {column_name} {definition}"
+    )

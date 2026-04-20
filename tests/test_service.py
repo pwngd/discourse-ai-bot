@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from discourse_ai_bot.gifs import GifOption
 from discourse_ai_bot.models import ModelDecision, Notification
 from discourse_ai_bot.presence import NullPresenceAdapter
 from discourse_ai_bot.service import BotService
@@ -98,6 +99,7 @@ class FakeDiscourseClient:
                 "cooked": "<p>Private ping</p>",
             },
         }
+        self.upload_calls: list[dict[str, object]] = []
 
     def set_notification_type_map(self, mapping: dict[int, str]) -> None:
         self.notification_type_map = mapping
@@ -133,6 +135,10 @@ class FakeDiscourseClient:
             raise RuntimeError("post failed")
         self.created_posts.append(kwargs)
         return {"id": len(self.created_posts) + 5000, **kwargs}
+
+    def upload_file(self, file_path: object, **kwargs: object) -> dict[str, object]:
+        self.upload_calls.append({"file_path": file_path, **kwargs})
+        return {"id": 1, "url": "/uploads/default/original/1X/friendly_wave.gif"}
 
     def mark_notification_read(self, notification_id: int | None = None) -> dict[str, object]:
         if notification_id is not None:
@@ -341,6 +347,39 @@ class ServiceTests(unittest.TestCase):
             service.run_once()
 
             self.assertEqual(len(discourse.created_posts), 1)
+
+    def test_reply_can_append_uploaded_gif(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
+            discourse = FakeDiscourseClient([make_notification(9, 1, 100, 2)])
+            ollama = FakeOllamaClient(
+                [ModelDecision("reply", "Thanks for the ping.", "Direct ask", gif_id="friendly_wave")]
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(str(Path(temp_dir) / "bot.sqlite3")),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                randomizer=random.Random(0),
+                now_fn=clock.now,
+            )
+            gif_path = Path(temp_dir) / "friendly_wave.gif"
+            gif_path.write_bytes(b"GIF89a")
+
+            class FakeCatalog:
+                def list_options(self) -> list[GifOption]:
+                    return [GifOption("friendly_wave", gif_path, "friendly wave")]
+
+                def get(self, gif_id: str | None) -> GifOption | None:
+                    return GifOption("friendly_wave", gif_path, "friendly wave") if gif_id == "friendly_wave" else None
+
+            service.gif_catalog = FakeCatalog()  # type: ignore[assignment]
+            service.run_once()
+
+            self.assertEqual(len(discourse.upload_calls), 1)
+            self.assertIn("![friendly wave](https://forum.example.com/uploads/default/original/1X/friendly_wave.gif)", discourse.created_posts[0]["raw"])
 
     def test_session_cookie_mode_bootstraps_from_current_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

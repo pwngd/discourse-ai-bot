@@ -106,6 +106,20 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.bot_allowed_triggers, ("mentioned", "private_message"))
         self.assertEqual(settings.ollama_options, {"temperature": 0.2})
 
+    def test_autoread_post_time_supports_human_duration(self) -> None:
+        settings = load_settings(
+            {
+                "DISCOURSE_HOST": "https://forum.example.com",
+                "DISCOURSE_AUTH_MODE": "api_key",
+                "DISCOURSE_TOKEN": "token",
+                "DISCOURSE_USERNAME": "bot",
+                "BOT_OLLAMA_HOST": "http://localhost:11434",
+                "OLLAMA_MODEL": "qwen3",
+                "BOT_AUTOREAD_POST_TIME": "1m",
+            }
+        )
+        self.assertEqual(settings.bot_autoread_post_time_seconds, 60.0)
+
     def test_session_cookie_mode_is_inferred_from_cookie_string(self) -> None:
         settings = load_settings(
             {

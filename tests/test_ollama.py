@@ -51,7 +51,7 @@ class OllamaTests(unittest.TestCase):
             {
                 ("POST", "/chat"): {
                     "message": {
-                        "content": '{"action":"reply","reply_markdown":"Thanks!","reason":"Direct mention"}'
+                        "content": '{"action":"reply","reply_markdown":"Thanks!","reason":"Direct mention","gif_id":"friendly_wave"}'
                     }
                 }
             }
@@ -66,6 +66,7 @@ class OllamaTests(unittest.TestCase):
         )
         self.assertEqual(decision.action, "reply")
         self.assertEqual(decision.reply_markdown, "Thanks!")
+        self.assertEqual(decision.gif_id, "friendly_wave")
         method, path, kwargs = client.http.calls[0]
         self.assertEqual((method, path), ("POST", "/chat"))
         self.assertFalse(kwargs["json_body"]["stream"])

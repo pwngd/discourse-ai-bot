@@ -9,9 +9,14 @@ from pathlib import Path
 from discourse_ai_bot.cli import (
     _InteractiveState,
     _TerminalUI,
+    _autoread_worker_loop,
+    _build_autoread_plan,
     _handle_clear_command,
     _handle_config_command,
     _handle_slash_command,
+    _interactive_shell,
+    _read_topic_via_api,
+    _stop_autoread_if_running,
     _runtime_config_snapshot,
     _build_private_chat_system_prompt,
     _handle_interactive_input_safe,
@@ -20,7 +25,9 @@ from discourse_ai_bot.cli import (
     _retry_after_seconds,
     _trim_private_chat_messages,
     build_parser,
+    main,
 )
+from discourse_ai_bot.http import HttpError
 from discourse_ai_bot.settings import Settings
 from discourse_ai_bot.storage import BotStorage
 
@@ -91,6 +98,63 @@ class CliTests(unittest.TestCase):
 
         self.assertFalse(should_exit)
 
+    def test_interactive_shell_stops_cleanly_on_keyboard_interrupt(self) -> None:
+        settings = Settings(
+            discourse_host="https://forum.example.com",
+            discourse_auth_mode="session_cookie",
+            discourse_token=None,
+            discourse_username="bot",
+            ollama_host="http://localhost:11434",
+            ollama_model="qwen3",
+            discourse_cookie="session=abc",
+        )
+
+        class FakeService:
+            def run_once(self) -> None:
+                return None
+
+        ui = _TerminalUI()
+        with (
+            patch("discourse_ai_bot.cli._collect_health", return_value={"discourse_host": "x", "discourse_username": "bot", "user_id": 1, "ollama_model": "qwen3", "typing_mode": "none"}),
+            patch.object(ui, "prompt", side_effect=KeyboardInterrupt),
+        ):
+            result = _interactive_shell(
+                settings,
+                discourse=object(),  # type: ignore[arg-type]
+                ollama=object(),  # type: ignore[arg-type]
+                storage=object(),  # type: ignore[arg-type]
+                service=FakeService(),  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(result, 0)
+
+    def test_main_returns_zero_on_keyboard_interrupt_from_run_command(self) -> None:
+        settings = Settings(
+            discourse_host="https://forum.example.com",
+            discourse_auth_mode="session_cookie",
+            discourse_token=None,
+            discourse_username="bot",
+            ollama_host="http://localhost:11434",
+            ollama_model="qwen3",
+            discourse_cookie="session=abc",
+        )
+
+        class FakeService:
+            def run_forever(self) -> None:
+                raise KeyboardInterrupt
+
+        with (
+            patch("discourse_ai_bot.cli.load_settings", return_value=settings),
+            patch("discourse_ai_bot.cli.DiscourseClient", return_value=object()),
+            patch("discourse_ai_bot.cli.OllamaClient", return_value=object()),
+            patch("discourse_ai_bot.cli.BotStorage", return_value=object()),
+            patch("discourse_ai_bot.cli._build_presence_adapter", return_value=object()),
+            patch("discourse_ai_bot.cli.BotService", return_value=FakeService()),
+        ):
+            result = main(["run"])
+
+        self.assertEqual(result, 0)
+
     def test_trim_private_chat_messages_keeps_recent_context_only(self) -> None:
         messages = [{"role": "user", "content": str(index)} for index in range(20)]
 
@@ -142,6 +206,8 @@ class CliTests(unittest.TestCase):
         self.assertEqual(snapshot["poll_interval_seconds"], 9)
         self.assertEqual(snapshot["response_delay_min_seconds"], 1)
         self.assertEqual(snapshot["response_delay_max_seconds"], 3)
+        self.assertEqual(snapshot["autoread_post_time_seconds"], 120.0)
+        self.assertEqual(snapshot["autoread_post_time_label"], "2m")
         self.assertEqual(snapshot["max_context_posts"], 5)
         self.assertFalse(snapshot["mark_read_on_skip"])
 
@@ -199,6 +265,32 @@ class CliTests(unittest.TestCase):
         self.assertFalse(should_exit)
         self.assertEqual(settings.bot_max_context_posts, 12)
         self.assertEqual(service.context_resolver.max_posts, 12)
+
+    def test_handle_config_command_updates_autoread_time(self) -> None:
+        settings = Settings(
+            discourse_host="https://forum.example.com",
+            discourse_auth_mode="session_cookie",
+            discourse_token=None,
+            discourse_username="bot",
+            ollama_host="http://localhost:11434",
+            ollama_model="qwen3",
+            discourse_cookie="session=abc",
+        )
+
+        class FakeResolver:
+            max_posts = 8
+
+        class FakeService:
+            context_resolver = FakeResolver()
+
+        should_exit = _handle_config_command(
+            tokens=["/config", "autoread-time", "1h"],
+            settings=settings,
+            service=FakeService(),  # type: ignore[arg-type]
+        )
+
+        self.assertFalse(should_exit)
+        self.assertEqual(settings.bot_autoread_post_time_seconds, 3600.0)
 
     def test_handle_clear_command_clears_queue(self) -> None:
         class FakeService:
@@ -328,3 +420,182 @@ class CliTests(unittest.TestCase):
 
         self.assertFalse(should_exit)
         self.assertEqual(ollama.calls[0]["model"], "qwen3")
+
+    def test_build_autoread_plan_defaults_to_latest_topics(self) -> None:
+        class FakeDiscourse:
+            def list_categories(self) -> list[dict[str, object]]:
+                return [{"id": 1, "slug": "support"}, {"id": 2, "slug": "bug-reports"}]
+
+            def list_latest_topics(self, *, per_page: int = 5) -> dict[str, object]:
+                return {
+                    "topic_list": {
+                        "topics": [
+                            {"id": 100, "title": "One"},
+                            {"id": 101, "title": "Two"},
+                        ]
+                    }
+                }
+
+            def list_category_topics(self, *, slug: str, category_id: int) -> dict[str, object]:
+                return {
+                    "topic_list": {
+                        "topics": [
+                            {"id": 200 + category_id, "title": f"{slug}-{category_id}"},
+                        ]
+                    }
+                }
+
+        plan = _build_autoread_plan(disourse=FakeDiscourse(), target=None)  # type: ignore[arg-type]
+
+        self.assertEqual(plan["source"], "automatic_discovery")
+        self.assertEqual(plan["categories_count"], 2)
+        self.assertEqual(len(plan["topics"]), 4)
+
+    def test_read_topic_via_api_fetches_missing_posts(self) -> None:
+        class FakeDiscourse:
+            host = "https://forum.example.com"
+
+            def get_topic(self, topic_id: int) -> dict[str, object]:
+                return {
+                    "title": "Topic 100",
+                    "slug": "topic-100",
+                    "post_stream": {
+                        "stream": [900, 901, 902],
+                        "posts": [
+                            {"id": 900, "post_number": 1, "username": "alice"},
+                        ],
+                    },
+                }
+
+            def get_topic_posts(self, topic_id: int, post_ids: list[int]) -> dict[str, object]:
+                return {
+                    "post_stream": {
+                        "posts": [
+                            {"id": 901, "post_number": 2, "username": "bob"},
+                            {"id": 902, "post_number": 3, "username": "carol"},
+                        ]
+                    }
+                }
+
+            def record_topic_timings(self, **kwargs: object) -> dict[str, object]:
+                return {"success": "OK"}
+
+        with patch("discourse_ai_bot.cli.time.sleep"):
+            result = _read_topic_via_api(disourse=FakeDiscourse(), topic_id=100)  # type: ignore[arg-type]
+
+        self.assertEqual(result["posts_read"], 3)
+        self.assertEqual(result["authors"], ["alice", "bob", "carol"])
+
+    def test_read_topic_via_api_flushes_timings_batches(self) -> None:
+        class FakeDiscourse:
+            host = "https://forum.example.com"
+
+            def __init__(self) -> None:
+                self.timing_calls: list[dict[str, object]] = []
+
+            def get_topic(self, topic_id: int) -> dict[str, object]:
+                return {
+                    "title": "Topic 100",
+                    "slug": "topic-100",
+                    "post_stream": {
+                        "stream": [900, 901],
+                        "posts": [
+                            {"id": 900, "post_number": 1, "username": "alice"},
+                            {"id": 901, "post_number": 2, "username": "bob"},
+                        ],
+                    },
+                }
+
+            def record_topic_timings(self, **kwargs: object) -> dict[str, object]:
+                self.timing_calls.append(kwargs)
+                return {"success": "OK"}
+
+        discourse = FakeDiscourse()
+        with patch("discourse_ai_bot.cli.time.sleep"):
+            result = _read_topic_via_api(
+                disourse=discourse,  # type: ignore[arg-type]
+                topic_id=100,
+            )
+
+        self.assertEqual(result["posts_read"], 2)
+        self.assertEqual(len(discourse.timing_calls), 1)
+        self.assertEqual(discourse.timing_calls[0]["topic_id"], 100)
+        self.assertEqual(discourse.timing_calls[0]["timings"], {1: 120000, 2: 120000})
+        self.assertEqual(discourse.timing_calls[0]["topic_time"], 240000)
+
+    def test_read_topic_via_api_falls_back_to_individual_post_fetches(self) -> None:
+        class FakeDiscourse:
+            host = "https://forum.example.com"
+
+            def get_topic(self, topic_id: int) -> dict[str, object]:
+                return {
+                    "title": "Topic title",
+                    "slug": "topic-title",
+                    "post_stream": {
+                        "stream": [901, 902],
+                        "posts": [],
+                    },
+                }
+
+            def get_topic_posts(self, topic_id: int, post_ids: list[int]) -> dict[str, object]:
+                raise HttpError(
+                    status_code=403,
+                    url=f"https://forum.example.com/t/{topic_id}/posts.json",
+                    body="forbidden",
+                )
+
+            def get_post(self, post_id: int) -> dict[str, object]:
+                return {
+                    "id": post_id,
+                    "post_number": 1 if post_id == 901 else 2,
+                    "username": "alice" if post_id == 901 else "bob",
+                }
+
+            def record_topic_timings(self, **kwargs: object) -> dict[str, object]:
+                return {"success": "OK"}
+
+        with patch("discourse_ai_bot.cli.time.sleep"):
+            result = _read_topic_via_api(disourse=FakeDiscourse(), topic_id=100)  # type: ignore[arg-type]
+
+        self.assertEqual(result["posts_read"], 2)
+        self.assertEqual(result["authors"], ["alice", "bob"])
+
+    def test_stop_autoread_if_running_clears_state(self) -> None:
+        stop_event = threading.Event()
+        worker = threading.Thread(target=stop_event.wait, args=(0.1,), daemon=True)
+        worker.start()
+        state = _InteractiveState(
+            autoread_stop_event=stop_event,
+            autoread_thread=worker,
+            autoread_target="https://forum.example.com/t/example/100",
+        )
+
+        _stop_autoread_if_running(state, reason="test interrupt")
+
+        self.assertIsNone(state.autoread_stop_event)
+        self.assertIsNone(state.autoread_thread)
+        self.assertIsNone(state.autoread_target)
+
+    def test_autoread_worker_loop_logs_and_survives_topic_errors(self) -> None:
+        class FakeDiscourse:
+            def list_categories(self) -> list[dict[str, object]]:
+                return []
+
+            def list_latest_topics(self, *, per_page: int = 5) -> dict[str, object]:
+                return {"topic_list": {"topics": [{"id": 100, "title": "Broken topic"}]}}
+
+            def get_topic(self, topic_id: int) -> dict[str, object]:
+                raise RuntimeError("topic fetch failed")
+
+        stop_event = threading.Event()
+        waits = {"count": 0}
+
+        def fake_wait(_event: threading.Event | None, _seconds: float) -> bool:
+            waits["count"] += 1
+            if waits["count"] >= 1:
+                stop_event.set()
+                return True
+            return False
+
+        with patch("discourse_ai_bot.cli._wait_for_autoread", side_effect=fake_wait):
+            _autoread_worker_loop(FakeDiscourse(), None, stop_event, 120.0)  # type: ignore[arg-type]

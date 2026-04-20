@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from discourse_ai_bot.utils import parse_duration_seconds
+
 
 DEFAULT_ALLOWED_TRIGGERS = ("mentioned", "replied", "private_message")
 DEFAULT_SYSTEM_PROMPT = (
@@ -32,6 +34,7 @@ class Settings:
     bot_poll_interval_seconds: float = 15.0
     bot_response_delay_min_seconds: float = 10.0
     bot_response_delay_max_seconds: float = 45.0
+    bot_autoread_post_time_seconds: float = 120.0
     bot_max_context_posts: int = 8
     bot_mark_read_on_skip: bool = True
     bot_allowed_triggers: tuple[str, ...] = DEFAULT_ALLOWED_TRIGGERS
@@ -141,6 +144,11 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         bot_poll_interval_seconds=_parse_float(values, "BOT_POLL_INTERVAL_SECONDS", default=15.0),
         bot_response_delay_min_seconds=delay_min,
         bot_response_delay_max_seconds=delay_max,
+        bot_autoread_post_time_seconds=_parse_duration_env(
+            values,
+            "BOT_AUTOREAD_POST_TIME",
+            default=120.0,
+        ),
         bot_max_context_posts=_parse_int(values, "BOT_MAX_CONTEXT_POSTS", default=8),
         bot_mark_read_on_skip=_parse_bool(values, "BOT_MARK_READ_ON_SKIP", default=True),
         bot_allowed_triggers=_parse_csv(
@@ -166,6 +174,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         raise ValueError("BOT_MAX_CONTEXT_POSTS must be greater than 0.")
     if settings.bot_poll_interval_seconds <= 0:
         raise ValueError("BOT_POLL_INTERVAL_SECONDS must be greater than 0.")
+    if settings.bot_autoread_post_time_seconds <= 0:
+        raise ValueError("BOT_AUTOREAD_POST_TIME must be greater than 0.")
     if settings.ollama_timeout_seconds <= 0:
         raise ValueError("OLLAMA_TIMEOUT_SECONDS must be greater than 0.")
     return settings
@@ -218,6 +228,13 @@ def _parse_int(values: dict[str, str], name: str, *, default: int) -> int:
     if raw is None or not raw.strip():
         return default
     return int(raw)
+
+
+def _parse_duration_env(values: dict[str, str], name: str, *, default: float) -> float:
+    raw = values.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return parse_duration_seconds(raw, field_name=name)
 
 
 def _parse_csv(raw: str | None, *, default: tuple[str, ...]) -> tuple[str, ...]:

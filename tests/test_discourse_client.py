@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from discourse_ai_bot.discourse import DiscourseClient
 from discourse_ai_bot.http import HttpError
@@ -174,6 +176,85 @@ class DiscourseClientTests(unittest.TestCase):
         self.assertIsNone(target["post_id"])
         self.assertEqual(target["post_number"], 63)
 
+    def test_resolve_category_url_supports_category_links(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="api_key",
+            token="token",
+            username="bot",
+        )
+
+        target = client.resolve_category_url("https://forum.example.com/c/support/7")
+
+        self.assertEqual(target["slug"], "support")
+        self.assertEqual(target["category_id"], 7)
+
+    def test_list_latest_topics_uses_documented_endpoint(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="api_key",
+            token="token",
+            username="bot",
+        )
+        client.http = FakeTransport(
+            {
+                ("GET", "/latest.json?per_page=5"): {
+                    "topic_list": {"topics": [{"id": 100, "title": "Latest topic"}]}
+                }
+            }
+        )
+
+        payload = client.list_latest_topics(per_page=5)
+
+        self.assertEqual(payload["topic_list"]["topics"][0]["id"], 100)
+
+    def test_get_topic_posts_uses_specific_posts_endpoint(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="api_key",
+            token="token",
+            username="bot",
+        )
+        client.http = FakeTransport(
+            {
+                ("GET", "/t/100/posts.json?post_ids%5B%5D=901&post_ids%5B%5D=902"): {
+                    "post_stream": {"posts": [{"id": 901, "post_number": 2, "username": "alice"}]}
+                }
+            }
+        )
+
+        payload = client.get_topic_posts(100, [901, 902])
+
+        self.assertEqual(payload["post_stream"]["posts"][0]["id"], 901)
+
+    def test_upload_file_uses_documented_uploads_endpoint(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="api_key",
+            token="token",
+            username="bot",
+        )
+        client.http = FakeTransport(
+            {
+                ("POST", "/uploads.json"): {
+                    "id": 1,
+                    "url": "/uploads/default/original/1X/friendly_wave.gif",
+                    "short_url": "upload://friendly.gif",
+                }
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            gif_path = Path(temp_dir) / "friendly_wave.gif"
+            gif_path.write_bytes(b"GIF89a")
+            payload = client.upload_file(gif_path)
+
+        self.assertEqual(payload["url"], "/uploads/default/original/1X/friendly_wave.gif")
+        method, path, kwargs = client.http.calls[0]
+        self.assertEqual((method, path), ("POST", "/uploads.json"))
+        self.assertEqual(kwargs["multipart_body"]["type"], "composer")
+        self.assertIn("file", kwargs["multipart_files"])
+
     def test_session_cookie_create_post_fetches_csrf_and_uses_form_post(self) -> None:
         client = DiscourseClient(
             "https://forum.example.com",
@@ -217,3 +298,31 @@ class DiscourseClientTests(unittest.TestCase):
         self.assertEqual(response["id"], 1001)
         self.assertEqual(client.http.calls[2][1], "/session/csrf.json")
         self.assertEqual(client.http.calls[3][2]["headers"]["X-CSRF-Token"], "fresh-token")
+
+    def test_record_topic_timings_uses_form_payload_and_session_headers(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="session_cookie",
+            cookie="session=abc; theme=dark",
+        )
+        client.http = SequenceTransport(
+            [
+                {"csrf": "csrf-token"},
+                {"success": "OK"},
+            ]
+        )
+
+        response = client.record_topic_timings(
+            topic_id=4580953,
+            timings={172: 2033, 173: 2033},
+            topic_time=3033,
+            referer="https://forum.example.com/t/example/4580953/173",
+        )
+
+        self.assertEqual(response["success"], "OK")
+        method, path, kwargs = client.http.calls[1]
+        self.assertEqual((method, path), ("POST", "/topics/timings"))
+        self.assertEqual(kwargs["form_body"]["topic_id"], 4580953)
+        self.assertEqual(kwargs["form_body"]["timings[172]"], 2033)
+        self.assertEqual(kwargs["headers"]["Referer"], "https://forum.example.com/t/example/4580953/173")
+        self.assertEqual(kwargs["headers"]["Discourse-Present"], "true")

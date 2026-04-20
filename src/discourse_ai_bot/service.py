@@ -5,10 +5,12 @@ import random
 import time
 from collections import deque
 from datetime import timedelta
+from pathlib import Path
 from typing import Any, Callable
 
 from discourse_ai_bot.classifier import DEFAULT_NOTIFICATION_TYPES, NotificationClassifier
 from discourse_ai_bot.context import ContextResolver
+from discourse_ai_bot.gifs import GifCatalog, GifOption
 from discourse_ai_bot.models import BotIdentity, ClassifiedNotification, Notification
 from discourse_ai_bot.settings import Settings
 from discourse_ai_bot.utils import datetime_to_storage, parse_datetime, utc_now
@@ -43,6 +45,7 @@ class BotService:
             self.discourse,
             max_posts=settings.bot_max_context_posts,
         )
+        self.gif_catalog = GifCatalog(Path.cwd() / "gifs")
         self.activity_events: deque[dict[str, str]] = deque(maxlen=100)
 
     def bootstrap(self) -> BotIdentity:
@@ -181,6 +184,7 @@ class BotService:
                 "poll_interval_seconds": self.settings.bot_poll_interval_seconds,
                 "delay_min_seconds": self.settings.bot_response_delay_min_seconds,
                 "delay_max_seconds": self.settings.bot_response_delay_max_seconds,
+                "autoread_post_time_seconds": self.settings.bot_autoread_post_time_seconds,
                 "typing_mode": self.settings.bot_typing_mode,
                 "model": self.settings.ollama_model,
             },
@@ -220,6 +224,7 @@ class BotService:
                 system_prompt=self.settings.system_prompt,
                 identity=self.identity,
                 context=context,
+                available_gifs=self.gif_catalog.list_options(),
                 options=self.settings.ollama_options,
                 keep_alive=self.settings.ollama_keep_alive,
             )
@@ -268,6 +273,7 @@ class BotService:
             topic_id=context.topic_id,
             reply_to_post_number=reply_to_post_number,
             raw=decision.reply_markdown,
+            gif_id=decision.gif_id,
             decision_reason=decision.reason,
             due_at=datetime_to_storage(due_at),
             created_at=datetime_to_storage(now),
@@ -379,6 +385,7 @@ class BotService:
                 identity=self.identity,
                 context=context,
                 user_request=command.user_request,
+                available_gifs=self.gif_catalog.list_options(),
                 options=self.settings.ollama_options,
                 keep_alive=self.settings.ollama_keep_alive,
             )
@@ -420,6 +427,7 @@ class BotService:
                 int(target["post_number"]) if target.get("post_number") is not None else context.reply_to_post_number
             ),
             raw=decision.reply_markdown,
+            gif_id=decision.gif_id,
             ollama_reason=decision.reason,
             due_at=datetime_to_storage(due_at),
             presence_channel=presence_channel,
@@ -449,8 +457,9 @@ class BotService:
                 )
 
         try:
+            final_raw = self._build_post_body(job.raw, job.gif_id)
             response = self.discourse.create_post(
-                raw=job.raw,
+                raw=final_raw,
                 topic_id=job.topic_id,
                 reply_to_post_number=job.reply_to_post_number,
             )
@@ -515,8 +524,9 @@ class BotService:
                 )
 
         try:
+            final_raw = self._build_post_body(command.raw or "", command.gif_id)
             response = self.discourse.create_post(
-                raw=command.raw or "",
+                raw=final_raw,
                 topic_id=command.topic_id,
                 reply_to_post_number=command.reply_to_post_number,
             )
@@ -579,6 +589,51 @@ class BotService:
     @staticmethod
     def _backoff_seconds(attempts: int) -> float:
         return min(3600.0, 30.0 * (2 ** max(attempts - 1, 0)))
+
+    def _build_post_body(self, raw: str, gif_id: str | None) -> str:
+        base = raw.strip()
+        if not gif_id:
+            return base
+
+        option = self.gif_catalog.get(gif_id)
+        if option is None:
+            self._record_activity(
+                f"GIF '{gif_id}' was requested but not found. Sending text only.",
+                level="warning",
+            )
+            self.logger.warning("GIF '%s' was requested but not found. Sending text only.", gif_id)
+            return base
+
+        upload_url = self._upload_gif(option)
+        if upload_url is None:
+            return base
+        return f"{base}\n\n![{option.alt_text}]({upload_url})".strip()
+
+    def _upload_gif(self, option: GifOption) -> str | None:
+        try:
+            response = self.discourse.upload_file(option.path, upload_type="composer", synchronous=True)
+        except Exception as exc:
+            self._record_activity(
+                f"Failed to upload GIF '{option.gif_id}': {exc}. Sending text only.",
+                level="warning",
+            )
+            self.logger.warning("Failed to upload GIF '%s': %s", option.gif_id, exc)
+            return None
+
+        raw_url = response.get("url") if isinstance(response, dict) else None
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            self._record_activity(
+                f"Upload response for GIF '{option.gif_id}' did not include a URL. Sending text only.",
+                level="warning",
+            )
+            self.logger.warning(
+                "Upload response for GIF '%s' did not include a usable URL.",
+                option.gif_id,
+            )
+            return None
+        if raw_url.startswith(("http://", "https://")):
+            return raw_url
+        return f"{self.settings.discourse_host.rstrip('/')}/{raw_url.lstrip('/')}"
 
     def _record_activity(self, message: str, *, level: str = "info") -> None:
         self.activity_events.append(

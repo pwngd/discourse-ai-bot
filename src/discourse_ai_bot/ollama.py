@@ -4,6 +4,7 @@ import json
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
+from discourse_ai_bot.gifs import GifOption
 from discourse_ai_bot.http import JsonHttpClient, HttpRequestError
 from discourse_ai_bot.models import BotIdentity, ModelDecision, TopicContext, TopicPost
 from discourse_ai_bot.utils import strip_html
@@ -15,6 +16,7 @@ RESPONSE_SCHEMA = {
         "action": {"type": "string", "enum": ["reply", "skip"]},
         "reply_markdown": {"type": "string"},
         "reason": {"type": "string"},
+        "gif_id": {"type": ["string", "null"]},
     },
     "required": ["action", "reply_markdown", "reason"],
     "additionalProperties": False,
@@ -27,6 +29,9 @@ Rules:
 - Reply only if a response is genuinely useful.
 - Skipping is correct when the post does not need an answer, is purely informational, or is unsafe/spam.
 - If you reply, write natural Markdown for a Discourse post body.
+- If optional GIF choices are provided, you may select at most one by returning gif_id.
+- Only choose a GIF when it clearly improves a light, friendly, or celebratory reply.
+- Do not choose a GIF for serious, sensitive, moderation, safety, or uncertain situations.
 - Keep replies concise, accurate, and grounded in the conversation provided.
 - Do not mention internal policies, JSON, schemas, or that you are deciding.
 """.strip()
@@ -37,6 +42,7 @@ The operator has explicitly requested that the bot send a reply to the target Di
 Rules:
 - You must return action="reply".
 - Write only the bot's reply as Markdown in reply_markdown.
+- If optional GIF choices are provided, you may choose one by returning gif_id, but only when it genuinely helps.
 - Follow the operator's request while staying safe and grounded in the provided discussion.
 - Keep the reply concise unless the operator asks for more depth.
 """.strip()
@@ -94,6 +100,7 @@ class OllamaClient:
         system_prompt: str,
         identity: BotIdentity,
         context: TopicContext,
+        available_gifs: list[GifOption] | None = None,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
     ) -> ModelDecision:
@@ -108,7 +115,7 @@ class OllamaClient:
                 },
                 {
                     "role": "user",
-                    "content": _build_context_prompt(identity, context),
+                    "content": _build_context_prompt(identity, context, available_gifs),
                 },
             ],
         }
@@ -133,6 +140,7 @@ class OllamaClient:
         identity: BotIdentity,
         context: TopicContext,
         user_request: str,
+        available_gifs: list[GifOption] | None = None,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
     ) -> ModelDecision:
@@ -147,7 +155,7 @@ class OllamaClient:
                 },
                 {
                     "role": "user",
-                    "content": _build_manual_request_prompt(identity, context, user_request),
+                    "content": _build_manual_request_prompt(identity, context, user_request, available_gifs),
                 },
             ],
         }
@@ -295,12 +303,15 @@ class OllamaClient:
         action = payload.get("action")
         reply_markdown = payload.get("reply_markdown")
         reason = payload.get("reason")
+        gif_id = payload.get("gif_id")
         if action not in {"reply", "skip"}:
             raise OllamaResponseError("Ollama action must be 'reply' or 'skip'.")
         if not isinstance(reply_markdown, str):
             raise OllamaResponseError("reply_markdown must be a string.")
         if not isinstance(reason, str) or not reason.strip():
             raise OllamaResponseError("reason must be a non-empty string.")
+        if gif_id is not None and (not isinstance(gif_id, str) or not gif_id.strip()):
+            raise OllamaResponseError("gif_id must be null or a non-empty string.")
         if action == "reply" and not reply_markdown.strip():
             raise OllamaResponseError("reply_markdown must be non-empty when action is 'reply'.")
 
@@ -308,6 +319,7 @@ class OllamaClient:
             action=action,
             reply_markdown=reply_markdown.strip(),
             reason=reason.strip(),
+            gif_id=gif_id.strip().lower() if isinstance(gif_id, str) else None,
         )
 
 
@@ -319,7 +331,11 @@ def _normalize_ollama_host(host: str) -> str:
     return f"{clean}/api"
 
 
-def _build_context_prompt(identity: BotIdentity, context: TopicContext) -> str:
+def _build_context_prompt(
+    identity: BotIdentity,
+    context: TopicContext,
+    available_gifs: list[GifOption] | None = None,
+) -> str:
     recent_posts = "\n\n".join(_format_post(post) for post in context.recent_posts)
     target_section = _format_target_post(context.target_post)
     return "\n".join(
@@ -334,6 +350,8 @@ def _build_context_prompt(identity: BotIdentity, context: TopicContext) -> str:
             target_section,
             "Recent conversation:",
             recent_posts or "(no recent posts available)",
+            "",
+            _format_gif_options(available_gifs),
             "",
             "Decide whether the bot should reply.",
             "If replying, produce only the bot's post body as Markdown.",
@@ -363,15 +381,26 @@ def _build_manual_request_prompt(
     identity: BotIdentity,
     context: TopicContext,
     user_request: str,
+    available_gifs: list[GifOption] | None = None,
 ) -> str:
     return "\n".join(
         [
-            _build_context_prompt(identity, context),
+            _build_context_prompt(identity, context, available_gifs),
             "",
             f"Operator request: {user_request}",
             "Write the reply requested by the operator.",
         ]
     )
+
+
+def _format_gif_options(available_gifs: list[GifOption] | None) -> str:
+    if not available_gifs:
+        return "Available optional GIFs: none."
+    lines = ["Available optional GIFs:"]
+    for option in available_gifs:
+        lines.append(f"- {option.gif_id}: {option.description}")
+    lines.append("Return gif_id as null when no GIF should be included.")
+    return "\n".join(lines)
 
 
 def _build_activity_summary_prompt(

@@ -112,6 +112,7 @@ class ModelDecision:
     action: str
     reply_markdown: str
     reason: str
+    gif_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -120,6 +121,7 @@ class PendingJob:
     topic_id: int
     reply_to_post_number: int | None
     raw: str
+    gif_id: str | None
     decision_reason: str
     due_at: str
     attempts: int
@@ -140,6 +142,7 @@ class ManualCommand:
     topic_id: int | None
     reply_to_post_number: int | None
     raw: str | None
+    gif_id: str | None
     ollama_reason: str | None
     due_at: str | None
     attempts: int

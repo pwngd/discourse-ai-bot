@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from typing import Any, Iterable
 from urllib.error import HTTPError, URLError
@@ -42,6 +43,8 @@ class JsonHttpClient:
         headers: dict[str, str] | None = None,
         json_body: dict[str, Any] | None = None,
         form_body: dict[str, Any] | Iterable[tuple[str, Any]] | None = None,
+        multipart_body: dict[str, Any] | None = None,
+        multipart_files: dict[str, tuple[str, bytes, str]] | None = None,
     ) -> Any:
         url = _resolve_url(self.base_url, path_or_url)
         request_headers = {
@@ -51,8 +54,12 @@ class JsonHttpClient:
         }
 
         data: bytes | None = None
-        if json_body is not None and form_body is not None:
-            raise ValueError("Only one of json_body or form_body may be provided.")
+        body_count = sum(
+            body is not None
+            for body in (json_body, form_body, multipart_body if (multipart_body or multipart_files) else None)
+        )
+        if body_count > 1:
+            raise ValueError("Only one of json_body, form_body, or multipart body may be provided.")
         if json_body is not None:
             data = json.dumps(json_body).encode("utf-8")
             request_headers.setdefault("Content-Type", "application/json")
@@ -65,6 +72,15 @@ class JsonHttpClient:
             request_headers.setdefault(
                 "Content-Type",
                 "application/x-www-form-urlencoded; charset=UTF-8",
+            )
+        elif multipart_body is not None or multipart_files is not None:
+            boundary, data = _encode_multipart_form_data(
+                multipart_body or {},
+                multipart_files or {},
+            )
+            request_headers.setdefault(
+                "Content-Type",
+                f"multipart/form-data; boundary={boundary}",
             )
 
         request = Request(url=url, data=data, headers=request_headers, method=method.upper())
@@ -144,3 +160,37 @@ def _resolve_url(base_url: str, path_or_url: str) -> str:
     if path_or_url.startswith(("http://", "https://")):
         return path_or_url
     return urljoin(base_url, path_or_url.lstrip("/"))
+
+
+def _encode_multipart_form_data(
+    fields: dict[str, Any],
+    files: dict[str, tuple[str, bytes, str]],
+) -> tuple[str, bytes]:
+    boundary = f"----CodexBoundary{uuid.uuid4().hex}"
+    chunks: list[bytes] = []
+
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    for name, (filename, content, content_type) in files.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                (
+                    f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                ).encode("utf-8"),
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+                content,
+                b"\r\n",
+            ]
+        )
+
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return boundary, b"".join(chunks)

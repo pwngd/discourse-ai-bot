@@ -7,6 +7,7 @@ import re
 import shlex
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -18,6 +19,7 @@ from discourse_ai_bot.presence import DiscoursePresenceAdapter, NullPresenceAdap
 from discourse_ai_bot.service import BotService
 from discourse_ai_bot.settings import Settings, load_settings
 from discourse_ai_bot.storage import BotStorage
+from discourse_ai_bot.utils import parse_duration_seconds
 
 try:
     from prompt_toolkit import PromptSession
@@ -51,11 +53,18 @@ except ImportError:  # pragma: no cover - exercised only when optional deps are 
 
 
 PROMPT_TEXT = ">>> Send command or message here "
+AUTOREAD_DEFAULT_TOPIC_LIMIT = 5
+AUTOREAD_DELAY_SECONDS = 0.003
+AUTOREAD_FETCH_DELAY_SECONDS = 0.01
+AUTOREAD_POST_CHUNK_SIZE = 50
+AUTOREAD_CYCLE_DELAY_SECONDS = 0.35
+AUTOREAD_TIMINGS_BATCH_SIZE = 50
 SLASH_COMMANDS = (
     "/help",
     "/health",
     "/stats",
     "/summarize",
+    "/autoread",
     "/config",
     "/notifications",
     "/manual",
@@ -85,6 +94,9 @@ class _InteractiveState:
     health_snapshot: dict[str, Any] | None = None
     private_chat_active: bool = False
     private_chat_messages: list[dict[str, str]] = field(default_factory=list)
+    autoread_stop_event: threading.Event | None = None
+    autoread_thread: threading.Thread | None = None
+    autoread_target: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -156,42 +168,48 @@ def main(argv: list[str] | None = None) -> int:
         presence_adapter=presence,
     )
 
-    if not args.command:
-        return _interactive_shell(settings, discourse, ollama, storage, service)
+    try:
+        if not args.command:
+            return _interactive_shell(settings, discourse, ollama, storage, service)
 
-    if args.command == "run":
-        service.run_forever()
+        if args.command == "run":
+            service.run_forever()
+            return 0
+        if args.command == "healthcheck":
+            return _healthcheck(settings, discourse, ollama)
+        if args.command == "list-notifications":
+            service.bootstrap()
+            print(json.dumps(service.inspect_notifications(), indent=2))
+            return 0
+        if args.command == "list-manual-commands":
+            service.bootstrap()
+            print(json.dumps(service.inspect_manual_commands(), indent=2))
+            return 0
+        if args.command == "queue-ai-reply":
+            command_id = storage.enqueue_manual_command(
+                post_url=args.post_url,
+                user_request=args.request,
+                created_at=_now_storage(),
+            )
+            print(json.dumps({"command_id": command_id, "status": "queued"}, indent=2))
+            return 0
+        if args.command == "reply":
+            return _manual_reply(args, discourse)
+        if args.command == "post-topic":
+            response = discourse.create_topic(
+                title=args.title,
+                raw=args.raw,
+                category=args.category,
+            )
+            print(json.dumps(response, indent=2))
+            return 0
+        parser.error(f"Unknown command: {args.command}")
+        return 2
+    except KeyboardInterrupt:
+        ui = _TerminalUI()
+        ui.print_blank()
+        ui.print_status("Bot stopped")
         return 0
-    if args.command == "healthcheck":
-        return _healthcheck(settings, discourse, ollama)
-    if args.command == "list-notifications":
-        service.bootstrap()
-        print(json.dumps(service.inspect_notifications(), indent=2))
-        return 0
-    if args.command == "list-manual-commands":
-        service.bootstrap()
-        print(json.dumps(service.inspect_manual_commands(), indent=2))
-        return 0
-    if args.command == "queue-ai-reply":
-        command_id = storage.enqueue_manual_command(
-            post_url=args.post_url,
-            user_request=args.request,
-            created_at=_now_storage(),
-        )
-        print(json.dumps({"command_id": command_id, "status": "queued"}, indent=2))
-        return 0
-    if args.command == "reply":
-        return _manual_reply(args, discourse)
-    if args.command == "post-topic":
-        response = discourse.create_topic(
-            title=args.title,
-            raw=args.raw,
-            category=args.category,
-        )
-        print(json.dumps(response, indent=2))
-        return 0
-    parser.error(f"Unknown command: {args.command}")
-    return 2
 
 
 def _healthcheck(settings: Settings, discourse: DiscourseClient, ollama: OllamaClient) -> int:
@@ -312,6 +330,8 @@ def _interactive_shell(
             if not raw:
                 continue
 
+            _stop_autoread_if_running(state, reason="interrupted by operator input")
+
             should_exit = _handle_interactive_input_safe(
                 raw=raw,
                 settings=settings,
@@ -326,6 +346,7 @@ def _interactive_shell(
                 break
     finally:
         stop_event.set()
+        _stop_autoread_if_running(state)
         worker.join(timeout=2.0)
         ui.print_status("Bot stopped")
 
@@ -478,6 +499,13 @@ def _handle_slash_command(
         )
         _TerminalUI().print_summary(summary)
         return False
+    if command == "/autoread":
+        target = tokens[1] if len(tokens) > 1 else None
+        if len(tokens) > 2:
+            _TerminalUI().print_error("Usage: /autoread or /autoread <topic_or_category_url>")
+            return False
+        _start_autoread(state=state, settings=settings, discourse=discourse, target=target)
+        return False
     if command == "/config":
         return _handle_config_command(tokens=tokens, settings=settings, service=service)
     if command == "/notifications":
@@ -607,6 +635,18 @@ def _handle_config_command(
         ui.print_success(f"Updated poll interval to {poll_seconds:.2f}s")
         return False
 
+    if subcommand == "autoread-time":
+        if len(tokens) != 3:
+            ui.print_error("Usage: /config autoread-time <duration>")
+            ui.print_muted("Examples: /config autoread-time 30s, /config autoread-time 1m, /config autoread-time 1h")
+            return False
+        post_time_seconds = parse_duration_seconds(tokens[2], field_name="autoread-time")
+        if post_time_seconds <= 0:
+            raise ValueError("AutoRead post time must be greater than 0.")
+        object.__setattr__(settings, "bot_autoread_post_time_seconds", post_time_seconds)
+        ui.print_success(f"Updated AutoRead per-post timing to {_format_duration(post_time_seconds)}")
+        return False
+
     if subcommand == "context":
         if len(tokens) != 3:
             ui.print_error("Usage: /config context <post_count>")
@@ -672,11 +712,366 @@ def _handle_clear_command(
     return False
 
 
+def _start_autoread(
+    *,
+    state: _InteractiveState,
+    settings: Settings,
+    discourse: DiscourseClient,
+    target: str | None,
+) -> None:
+    ui = _TerminalUI()
+    stop_event = threading.Event()
+    state.autoread_stop_event = stop_event
+    state.autoread_target = target
+    thread = threading.Thread(
+        target=_autoread_worker_loop,
+        args=(discourse, target, stop_event, settings.bot_autoread_post_time_seconds),
+        name="discourse-ai-bot-autoread",
+        daemon=True,
+    )
+    state.autoread_thread = thread
+    thread.start()
+    label = target or "automatic discovery"
+    ui.print_status(f"AutoRead started for {label}. Submit any command or message to interrupt it.")
+
+
+def _stop_autoread_if_running(state: _InteractiveState, *, reason: str | None = None) -> None:
+    thread = state.autoread_thread
+    stop_event = state.autoread_stop_event
+    if thread is None or stop_event is None:
+        return
+    stop_event.set()
+    if thread.is_alive():
+        thread.join(timeout=2.0)
+    if reason:
+        _TerminalUI().print_muted(f"AutoRead stopped: {reason}.")
+    state.autoread_thread = None
+    state.autoread_stop_event = None
+    state.autoread_target = None
+
+
+def _autoread_worker_loop(
+    disourse: DiscourseClient,
+    target: str | None,
+    stop_event: threading.Event,
+    post_time_seconds: float,
+) -> None:
+    ui = _TerminalUI()
+    logger = logging.getLogger(__name__)
+    cycle_number = 0
+    while not stop_event.is_set():
+        try:
+            cycle_number += 1
+            plan = _build_autoread_plan(disourse=disourse, target=target)
+            results: list[dict[str, Any]] = []
+            for item in plan["topics"]:
+                if stop_event.is_set():
+                    break
+                topic_id = int(item["topic_id"])
+                try:
+                    topic_result = _read_topic_via_api(
+                        disourse=disourse,
+                        topic_id=topic_id,
+                        stop_event=stop_event,
+                        post_time_seconds=post_time_seconds,
+                    )
+                except Exception as exc:
+                    logger.exception("AutoRead topic %s failed: %s", topic_id, exc)
+                    ui.print_error(f"AutoRead topic {topic_id} failed, see logs above.")
+                    continue
+                if topic_result["posts_read"] > 0:
+                    ui.print_muted(
+                        f"AutoRead cycle {cycle_number}: {topic_result['title']} "
+                        f"({topic_result['posts_read']} posts)"
+                    )
+                    results.append(topic_result)
+            if results:
+                ui.print_autoread_summary(
+                    {
+                        "source": plan["source"],
+                        "categories_count": plan["categories_count"],
+                        "topics_requested": len(plan["topics"]),
+                        "topics_read": len(results),
+                        "total_posts_read": sum(int(item["posts_read"]) for item in results),
+                        "topics": results,
+                    }
+                )
+        except Exception as exc:
+            logger.exception("AutoRead cycle failed: %s", exc)
+            ui.print_error("AutoRead cycle failed, see logs above.")
+        if _wait_for_autoread(stop_event, AUTOREAD_CYCLE_DELAY_SECONDS):
+            break
+
+
+def _build_autoread_plan(*, disourse: DiscourseClient, target: str | None) -> dict[str, Any]:
+    categories = disourse.list_categories()
+    if not target:
+        latest = disourse.list_latest_topics(per_page=100)
+        topics_by_id = {
+            int(item["topic_id"]): item
+            for item in _extract_topic_list(latest)
+        }
+        for category in categories:
+            slug = category.get("slug")
+            category_id = category.get("id")
+            if not isinstance(slug, str) or not isinstance(category_id, int):
+                continue
+            payload = disourse.list_category_topics(slug=slug, category_id=category_id)
+            for topic in _extract_topic_list(payload):
+                topics_by_id[int(topic["topic_id"])] = topic
+        topics = list(topics_by_id.values())
+        return {
+            "source": "automatic_discovery",
+            "categories_count": len(categories),
+            "topics": topics,
+        }
+
+    if _looks_like_url(target):
+        try:
+            category = disourse.resolve_category_url(target)
+        except ValueError:
+            category = None
+        if category is not None:
+            payload = disourse.list_category_topics(
+                slug=str(category["slug"]),
+                category_id=int(category["category_id"]),
+            )
+            topics = _extract_topic_list(payload)
+            return {
+                "source": f"category:{category['slug']}",
+                "categories_count": len(categories),
+                "topics": topics,
+            }
+
+        post_target = disourse.resolve_post_url(target)
+        topic_id = int(post_target["topic_id"])
+        topic = disourse.get_topic(topic_id, post_number=post_target.get("post_number"))
+        return {
+            "source": f"topic:{topic_id}",
+            "categories_count": len(categories),
+            "topics": [
+                {
+                    "topic_id": topic_id,
+                    "title": topic.get("title"),
+                    "posts_count": topic.get("posts_count"),
+                }
+            ],
+        }
+
+    raise ValueError("Usage: /autoread or /autoread <topic_or_category_url>")
+
+
+def _read_topic_via_api(
+    *,
+    disourse: DiscourseClient,
+    topic_id: int,
+    stop_event: threading.Event | None = None,
+    post_time_seconds: float = 120.0,
+) -> dict[str, Any]:
+    topic = disourse.get_topic(topic_id)
+    title = str(topic.get("title", f"Topic {topic_id}"))
+    topic_slug = str(topic.get("slug") or topic.get("topic_slug") or "")
+    post_stream = topic.get("post_stream") if isinstance(topic, dict) else {}
+    stream = post_stream.get("stream", []) if isinstance(post_stream, dict) else []
+    loaded_posts = post_stream.get("posts", []) if isinstance(post_stream, dict) else []
+    posts_by_id = {
+        int(post["id"]): post
+        for post in loaded_posts
+        if isinstance(post, dict) and post.get("id") is not None
+    }
+    ordered_ids = [int(post_id) for post_id in stream if isinstance(post_id, int)]
+    if not ordered_ids:
+        ordered_ids = sorted(posts_by_id.keys())
+
+    read_posts: list[dict[str, Any]] = []
+    timing_batch: list[dict[str, Any]] = []
+    index = 0
+    while index < len(ordered_ids):
+        current_id = ordered_ids[index]
+        if current_id not in posts_by_id:
+            chunk_ids = [
+                post_id
+                for post_id in ordered_ids[index : index + AUTOREAD_POST_CHUNK_SIZE]
+                if post_id not in posts_by_id
+            ]
+            if chunk_ids:
+                extra_posts = _load_topic_posts_with_fallback(
+                    disourse=disourse,
+                    topic_id=topic_id,
+                    post_ids=chunk_ids,
+                )
+                for post in extra_posts:
+                    if isinstance(post, dict) and post.get("id") is not None:
+                        posts_by_id[int(post["id"])] = post
+                if _wait_for_autoread(stop_event, AUTOREAD_FETCH_DELAY_SECONDS):
+                    break
+                continue
+
+        post = posts_by_id.get(current_id)
+        if isinstance(post, dict):
+            post_number = int(post.get("post_number", len(read_posts) + 1))
+            read_posts.append(
+                {
+                    "post_id": int(post["id"]),
+                    "post_number": post_number,
+                    "username": str(post.get("username", "")),
+                }
+            )
+            timing_batch.append(
+                {
+                    "post_number": post_number,
+                    "duration_ms": _autoread_duration_ms(post_time_seconds),
+                }
+            )
+            if len(timing_batch) >= AUTOREAD_TIMINGS_BATCH_SIZE:
+                _flush_autoread_timings_safely(
+                    disourse=disourse,
+                    topic_id=topic_id,
+                    topic_slug=topic_slug,
+                    batch=timing_batch,
+                )
+                timing_batch = []
+        if _wait_for_autoread(stop_event, AUTOREAD_DELAY_SECONDS):
+            break
+        index += 1
+
+    if timing_batch:
+        _flush_autoread_timings_safely(
+            disourse=disourse,
+            topic_id=topic_id,
+            topic_slug=topic_slug,
+            batch=timing_batch,
+        )
+
+    return {
+        "topic_id": topic_id,
+        "title": title,
+        "posts_read": len(read_posts),
+        "authors": sorted({item["username"] for item in read_posts if item["username"]}),
+    }
+
+
+def _wait_for_autoread(stop_event: threading.Event | None, seconds: float) -> bool:
+    if stop_event is None:
+        time.sleep(seconds)
+        return False
+    return stop_event.wait(seconds)
+
+
+def _load_topic_posts_with_fallback(
+    *,
+    disourse: DiscourseClient,
+    topic_id: int,
+    post_ids: list[int],
+) -> list[dict[str, Any]]:
+    logger = logging.getLogger(__name__)
+    try:
+        payload = disourse.get_topic_posts(topic_id, post_ids)
+    except HttpError as exc:
+        logger.warning(
+            "AutoRead bulk post fetch failed for topic %s (%s). Falling back to per-post reads.",
+            topic_id,
+            exc,
+        )
+        fallback_posts: list[dict[str, Any]] = []
+        for post_id in post_ids:
+            try:
+                post = disourse.get_post(post_id)
+            except HttpError as post_exc:
+                logger.warning(
+                    "AutoRead fallback post fetch failed for topic %s post %s: %s",
+                    topic_id,
+                    post_id,
+                    post_exc,
+                )
+                continue
+            if isinstance(post, dict) and post.get("id") is not None:
+                fallback_posts.append(post)
+        return fallback_posts
+
+    extra_stream = payload.get("post_stream", []) if isinstance(payload, dict) else {}
+    extra_posts = extra_stream.get("posts", []) if isinstance(extra_stream, dict) else []
+    return [post for post in extra_posts if isinstance(post, dict)]
+
+
+def _flush_autoread_timings_safely(
+    *,
+    disourse: DiscourseClient,
+    topic_id: int,
+    topic_slug: str,
+    batch: list[dict[str, Any]],
+) -> None:
+    logger = logging.getLogger(__name__)
+    try:
+        _flush_autoread_timings(
+            disourse=disourse,
+            topic_id=topic_id,
+            topic_slug=topic_slug,
+            batch=batch,
+        )
+    except HttpError as exc:
+        logger.warning("AutoRead timings update failed for topic %s: %s", topic_id, exc)
+
+
+def _flush_autoread_timings(
+    *,
+    disourse: DiscourseClient,
+    topic_id: int,
+    topic_slug: str,
+    batch: list[dict[str, Any]],
+) -> None:
+    if not batch:
+        return
+    last_post_number = int(batch[-1]["post_number"])
+    referer = f"{disourse.host}/t/{topic_slug}/{topic_id}/{last_post_number}" if topic_slug else f"{disourse.host}/t/{topic_id}/{last_post_number}"
+    timings = {int(item["post_number"]): int(item["duration_ms"]) for item in batch}
+    disourse.record_topic_timings(
+        topic_id=topic_id,
+        timings=timings,
+        topic_time=sum(timings.values()),
+        referer=referer,
+    )
+
+
+def _autoread_duration_ms(post_time_seconds: float) -> int:
+    return max(1, int(round(post_time_seconds * 1000)))
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = float(seconds)
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{int(seconds // 3600)}h"
+    if seconds >= 60 and seconds % 60 == 0:
+        return f"{int(seconds // 60)}m"
+    if seconds.is_integer():
+        return f"{int(seconds)}s"
+    return f"{seconds:.2f}s"
+
+
+def _extract_topic_list(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    topic_list = payload.get("topic_list", []) if isinstance(payload, dict) else {}
+    topics = topic_list.get("topics", []) if isinstance(topic_list, dict) else []
+    extracted: list[dict[str, Any]] = []
+    for item in topics:
+        if not isinstance(item, dict) or item.get("id") is None:
+            continue
+        extracted.append(
+            {
+                "topic_id": int(item["id"]),
+                "title": item.get("title"),
+                "posts_count": item.get("posts_count"),
+            }
+        )
+    return extracted
+
+
 def _runtime_config_snapshot(settings: Settings) -> dict[str, Any]:
     return {
         "poll_interval_seconds": settings.bot_poll_interval_seconds,
         "response_delay_min_seconds": settings.bot_response_delay_min_seconds,
         "response_delay_max_seconds": settings.bot_response_delay_max_seconds,
+        "autoread_post_time_seconds": settings.bot_autoread_post_time_seconds,
+        "autoread_post_time_label": _format_duration(settings.bot_autoread_post_time_seconds),
         "max_context_posts": settings.bot_max_context_posts,
         "mark_read_on_skip": settings.bot_mark_read_on_skip,
         "typing_mode": settings.bot_typing_mode,
@@ -811,7 +1206,11 @@ class _TerminalUI:
         return cls._instance
 
     def _init_once(self) -> None:
-        self.console = Console() if Console is not None else None
+        self.console = (
+            Console()
+            if Console is not None and getattr(sys.stdout, "isatty", lambda: False)()
+            else None
+        )
         self.history = InMemoryHistory() if InMemoryHistory is not None else None
         self._stream_active = False
         self.prompt_style = (
@@ -912,6 +1311,11 @@ class _TerminalUI:
                 "Delay",
                 f"{runtime.get('delay_min_seconds', 0)}s - {runtime.get('delay_max_seconds', 0)}s",
             )
+            if runtime.get("autoread_post_time_seconds") is not None:
+                summary_table.add_row(
+                    "AutoRead",
+                    _format_duration(float(runtime.get("autoread_post_time_seconds", 0))),
+                )
 
             queue_table = Table(title="Queue", header_style="bold cyan")
             queue_table.add_column("Metric", style="bold white")
@@ -946,6 +1350,11 @@ class _TerminalUI:
             f"{stats.get('runtime', {}).get('delay_min_seconds')}s - "
             f"{stats.get('runtime', {}).get('delay_max_seconds')}s"
         )
+        if stats.get("runtime", {}).get("autoread_post_time_seconds") is not None:
+            print(
+                "AutoRead: "
+                f"{_format_duration(float(stats.get('runtime', {}).get('autoread_post_time_seconds', 0)))}"
+            )
         print(f"Pending notification replies: {stats.get('storage', {}).get('pending_replies')}")
         print(f"Notification reply errors: {stats.get('storage', {}).get('pending_reply_errors')}")
         print(f"Manual queued: {stats.get('storage', {}).get('manual_queued')}")
@@ -963,6 +1372,38 @@ class _TerminalUI:
             return
         print(text)
 
+    def print_autoread_summary(self, result: dict[str, Any]) -> None:
+        if self.console is not None and Table is not None and Panel is not None:
+            summary = Table(show_header=False, box=None, pad_edge=False)
+            summary.add_column(style="bold cyan")
+            summary.add_column(style="white")
+            summary.add_row("Source", str(result.get("source", "")))
+            summary.add_row("Categories", str(result.get("categories_count", 0)))
+            summary.add_row("Topics read", str(result.get("topics_read", 0)))
+            summary.add_row("Posts read", str(result.get("total_posts_read", 0)))
+            self.console.print(Panel.fit(summary, title="[bold cyan]AutoRead[/bold cyan]", border_style="cyan"))
+
+            topics_table = Table(title="Topics", header_style="bold cyan")
+            topics_table.add_column("Topic", style="bold white")
+            topics_table.add_column("Posts", justify="right", style="green")
+            topics_table.add_column("Authors", style="grey78")
+            for topic in result.get("topics", []):
+                authors = ", ".join(topic.get("authors", [])[:5])
+                topics_table.add_row(
+                    str(topic.get("title", topic.get("topic_id"))),
+                    str(topic.get("posts_read", 0)),
+                    authors or "-",
+                )
+            self.console.print(topics_table)
+            return
+
+        print(f"AutoRead source: {result.get('source')}")
+        print(f"Categories: {result.get('categories_count')}")
+        print(f"Topics read: {result.get('topics_read')}")
+        print(f"Posts read: {result.get('total_posts_read')}")
+        for topic in result.get("topics", []):
+            print(f"- {topic.get('title')} ({topic.get('posts_read')} posts)")
+
     def print_blank(self) -> None:
         if self.console is not None:
             self.console.print("")
@@ -978,6 +1419,7 @@ class _TerminalUI:
             table.add_row("/health", "Show current Discourse and Ollama health")
             table.add_row("/stats", "Show a live local bot stats dashboard")
             table.add_row("/summarize", "Summarize the bot's last 5-10 recent actions")
+            table.add_row("/autoread [url]", "Read latest topics or all posts in a specific topic/category via API")
             table.add_row("/config", "Show or change runtime settings")
             table.add_row("/notifications", "Show the latest notification page")
             table.add_row("/manual", "Show queued and completed manual AI commands")
@@ -995,6 +1437,7 @@ class _TerminalUI:
             config_table.add_row("/config", "Show current runtime settings")
             config_table.add_row("/config delay <min> <max>", "Change reply delay for future jobs")
             config_table.add_row("/config poll <seconds>", "Change polling interval")
+            config_table.add_row("/config autoread-time <duration>", "Change AutoRead per-post timing like 30s, 1m, or 1h")
             config_table.add_row("/config context <count>", "Change recent-post context size")
             config_table.add_row("/config mark-read <on|off>", "Toggle marking skipped notifications read")
             self.console.print(config_table)
@@ -1006,6 +1449,7 @@ class _TerminalUI:
         print("/health")
         print("/stats")
         print("/summarize")
+        print("/autoread [url]")
         print("/config")
         print("/notifications")
         print("/manual")
@@ -1020,6 +1464,7 @@ class _TerminalUI:
         print("/config")
         print("/config delay <min> <max>")
         print("/config poll <seconds>")
+        print("/config autoread-time <duration>")
         print("/config context <count>")
         print("/config mark-read <on|off>")
 

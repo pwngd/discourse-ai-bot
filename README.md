@@ -10,6 +10,7 @@ Use `BOT_OLLAMA_HOST` to point the bot at Ollama. The project intentionally does
 - Supports optional custom headers like `Cookie` and `User-Agent` on all Discourse API requests
 - Polls notifications and reacts to mentions, replies, and private messages
 - Lets Ollama choose whether to reply or skip
+- Lets Ollama optionally include one approved GIF from `./gifs` when it replies
 - Schedules randomized reply delays and persists jobs in SQLite
 - Keeps working across restarts
 - Offers a best-effort optional presence adapter for `/presence/update`
@@ -77,6 +78,15 @@ python -m discourse_ai_bot queue-ai-reply --post-url "https://forum.example.com/
 
 The worker will pick up the queued command on its next polling cycle, fetch the target post context, send your request plus the discussion to Ollama, apply the normal randomized delay, simulate typing if enabled, and then post the reply back to that Discourse post.
 
+## Optional GIF Replies
+
+If you create a local `gifs` folder in the project root and place `.gif` files inside it, the bot can optionally choose one GIF when it generates a reply.
+
+- GIF choices are derived from filenames such as `friendly_wave.gif`
+- The filename becomes the GIF id and description shown to Ollama
+- The bot uploads the chosen GIF through the documented Discourse uploads API and appends it to the reply
+- If no GIF fits, the bot sends a normal text reply
+
 ## Interactive Shell
 
 Running `python -m discourse_ai_bot` opens an interactive prompt after the bot boots:
@@ -93,6 +103,15 @@ Plain text is also supported:
 - Type a message and the shell will ask for the target post URL.
 - Type a post URL and the shell will ask for the message to send.
 - Type `<post_url> | <message>` to queue a manual AI reply in one line.
+
+### AutoRead Timing
+
+You can control how much reading time each AutoRead post reports to Discourse:
+
+- Env default: `BOT_AUTOREAD_POST_TIME=2m`
+- Runtime command: `/config autoread-time 1m`
+
+Supported duration formats include `30s`, `1m`, and `1h`.
 
 ## Tests
 
