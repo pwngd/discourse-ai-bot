@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "discourse-ai-bot"
+version = "0.1.0"
+description = "A configurable Python bot that connects Discourse notifications to Ollama."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "OpenAI Codex" }]
+license = { text = "MIT" }
+dependencies = [
+    "prompt_toolkit>=3.0.52",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+discourse-ai-bot = "discourse_ai_bot.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

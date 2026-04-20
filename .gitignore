@@ -1,0 +1,6 @@
+.env
+.env.*
+*.env
+*.pem
+*.sqlite3
+.sqlite3
