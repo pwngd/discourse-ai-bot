@@ -16,6 +16,7 @@ from discourse_ai_bot.cli import (
     _handle_slash_command,
     _interactive_shell,
     _read_topic_via_api,
+    _simulate_autoread_post,
     _stop_autoread_if_running,
     _runtime_config_snapshot,
     _build_private_chat_system_prompt,
@@ -518,10 +519,12 @@ class CliTests(unittest.TestCase):
             )
 
         self.assertEqual(result["posts_read"], 2)
-        self.assertEqual(len(discourse.timing_calls), 1)
+        self.assertEqual(len(discourse.timing_calls), 2)
         self.assertEqual(discourse.timing_calls[0]["topic_id"], 100)
-        self.assertEqual(discourse.timing_calls[0]["timings"], {1: 120000, 2: 120000})
-        self.assertEqual(discourse.timing_calls[0]["topic_time"], 240000)
+        self.assertEqual(discourse.timing_calls[0]["timings"], {1: 120000})
+        self.assertEqual(discourse.timing_calls[0]["topic_time"], 120000)
+        self.assertEqual(discourse.timing_calls[1]["timings"], {2: 120000})
+        self.assertEqual(discourse.timing_calls[1]["topic_time"], 120000)
 
     def test_read_topic_via_api_falls_back_to_individual_post_fetches(self) -> None:
         class FakeDiscourse:
@@ -560,6 +563,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["posts_read"], 2)
         self.assertEqual(result["authors"], ["alice", "bob"])
 
+    def test_simulate_autoread_post_splits_long_duration_into_120_second_chunks(self) -> None:
+        class FakeDiscourse:
+            host = "https://forum.example.com"
+
+            def __init__(self) -> None:
+                self.timing_calls: list[dict[str, object]] = []
+
+            def record_topic_timings(self, **kwargs: object) -> dict[str, object]:
+                self.timing_calls.append(kwargs)
+                return {"success": "OK"}
+
+        discourse = FakeDiscourse()
+        with patch("discourse_ai_bot.cli.time.sleep"):
+            stopped = _simulate_autoread_post(
+                disourse=discourse,  # type: ignore[arg-type]
+                topic_id=100,
+                topic_slug="topic-100",
+                post_number=3,
+                stop_event=None,
+                post_time_seconds=360.0,
+            )
+
+        self.assertFalse(stopped)
+        self.assertEqual(len(discourse.timing_calls), 3)
+        self.assertEqual(
+            [call["topic_time"] for call in discourse.timing_calls],
+            [120000, 120000, 120000],
+        )
+        self.assertEqual(
+            [call["timings"] for call in discourse.timing_calls],
+            [{3: 120000}, {3: 120000}, {3: 120000}],
+        )
+
     def test_stop_autoread_if_running_clears_state(self) -> None:
         stop_event = threading.Event()
         worker = threading.Thread(target=stop_event.wait, args=(0.1,), daemon=True)
@@ -597,5 +633,13 @@ class CliTests(unittest.TestCase):
                 return True
             return False
 
-        with patch("discourse_ai_bot.cli._wait_for_autoread", side_effect=fake_wait):
+        ui = _TerminalUI()
+        with (
+            patch("discourse_ai_bot.cli._wait_for_autoread", side_effect=fake_wait),
+            patch.object(ui, "print_muted") as print_muted,
+        ):
             _autoread_worker_loop(FakeDiscourse(), None, stop_event, 120.0)  # type: ignore[arg-type]
+
+        self.assertTrue(
+            any("Starting Broken topic" in str(call.args[0]) for call in print_muted.call_args_list)
+        )

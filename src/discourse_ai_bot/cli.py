@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import logging
 import re
@@ -54,11 +55,10 @@ except ImportError:  # pragma: no cover - exercised only when optional deps are 
 
 PROMPT_TEXT = ">>> Send command or message here "
 AUTOREAD_DEFAULT_TOPIC_LIMIT = 5
-AUTOREAD_DELAY_SECONDS = 0.003
-AUTOREAD_FETCH_DELAY_SECONDS = 0.01
 AUTOREAD_POST_CHUNK_SIZE = 50
 AUTOREAD_CYCLE_DELAY_SECONDS = 0.35
-AUTOREAD_TIMINGS_BATCH_SIZE = 50
+AUTOREAD_MAX_TIMING_SECONDS = 120.0
+AUTOREAD_MAX_PARALLEL_TOPICS = 4
 SLASH_COMMANDS = (
     "/help",
     "/health",
@@ -764,27 +764,54 @@ def _autoread_worker_loop(
             cycle_number += 1
             plan = _build_autoread_plan(disourse=disourse, target=target)
             results: list[dict[str, Any]] = []
-            for item in plan["topics"]:
-                if stop_event.is_set():
-                    break
-                topic_id = int(item["topic_id"])
-                try:
-                    topic_result = _read_topic_via_api(
+            topic_items = list(plan["topics"])
+            max_workers = max(1, min(AUTOREAD_MAX_PARALLEL_TOPICS, len(topic_items)))
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="discourse-ai-bot-autoread-topic") as executor:
+                future_to_topic: dict[object, tuple[int, str]] = {}
+                for item in topic_items:
+                    if stop_event.is_set():
+                        break
+                    topic_id = int(item["topic_id"])
+                    title = str(item.get("title") or f"Topic {topic_id}")
+                    posts_count = item.get("posts_count")
+                    if isinstance(posts_count, int) and posts_count > 0:
+                        ui.print_muted(
+                            f"AutoRead cycle {cycle_number}: Starting {title} ({posts_count} planned posts)"
+                        )
+                    else:
+                        ui.print_muted(
+                            f"AutoRead cycle {cycle_number}: Starting {title}"
+                        )
+                    future = executor.submit(
+                        _read_topic_via_api,
                         disourse=disourse,
                         topic_id=topic_id,
                         stop_event=stop_event,
                         post_time_seconds=post_time_seconds,
                     )
-                except Exception as exc:
-                    logger.exception("AutoRead topic %s failed: %s", topic_id, exc)
-                    ui.print_error(f"AutoRead topic {topic_id} failed, see logs above.")
-                    continue
-                if topic_result["posts_read"] > 0:
-                    ui.print_muted(
-                        f"AutoRead cycle {cycle_number}: {topic_result['title']} "
-                        f"({topic_result['posts_read']} posts)"
+                    future_to_topic[future] = (topic_id, title)
+                while future_to_topic and not stop_event.is_set():
+                    done, _pending = wait(
+                        list(future_to_topic.keys()),
+                        timeout=0.25,
+                        return_when=FIRST_COMPLETED,
                     )
-                    results.append(topic_result)
+                    if not done:
+                        continue
+                    for future in done:
+                        topic_id, _title = future_to_topic.pop(future)
+                        try:
+                            topic_result = future.result()
+                        except Exception as exc:
+                            logger.exception("AutoRead topic %s failed: %s", topic_id, exc)
+                            ui.print_error(f"AutoRead topic {topic_id} failed, see logs above.")
+                            continue
+                        if topic_result["posts_read"] > 0:
+                            ui.print_muted(
+                                f"AutoRead cycle {cycle_number}: {topic_result['title']} "
+                                f"({topic_result['posts_read']} posts)"
+                            )
+                            results.append(topic_result)
             if results:
                 ui.print_autoread_summary(
                     {
@@ -884,7 +911,6 @@ def _read_topic_via_api(
         ordered_ids = sorted(posts_by_id.keys())
 
     read_posts: list[dict[str, Any]] = []
-    timing_batch: list[dict[str, Any]] = []
     index = 0
     while index < len(ordered_ids):
         current_id = ordered_ids[index]
@@ -903,8 +929,6 @@ def _read_topic_via_api(
                 for post in extra_posts:
                     if isinstance(post, dict) and post.get("id") is not None:
                         posts_by_id[int(post["id"])] = post
-                if _wait_for_autoread(stop_event, AUTOREAD_FETCH_DELAY_SECONDS):
-                    break
                 continue
 
         post = posts_by_id.get(current_id)
@@ -917,31 +941,16 @@ def _read_topic_via_api(
                     "username": str(post.get("username", "")),
                 }
             )
-            timing_batch.append(
-                {
-                    "post_number": post_number,
-                    "duration_ms": _autoread_duration_ms(post_time_seconds),
-                }
-            )
-            if len(timing_batch) >= AUTOREAD_TIMINGS_BATCH_SIZE:
-                _flush_autoread_timings_safely(
-                    disourse=disourse,
-                    topic_id=topic_id,
-                    topic_slug=topic_slug,
-                    batch=timing_batch,
-                )
-                timing_batch = []
-        if _wait_for_autoread(stop_event, AUTOREAD_DELAY_SECONDS):
-            break
+            if _simulate_autoread_post(
+                disourse=disourse,
+                topic_id=topic_id,
+                topic_slug=topic_slug,
+                post_number=post_number,
+                stop_event=stop_event,
+                post_time_seconds=post_time_seconds,
+            ):
+                break
         index += 1
-
-    if timing_batch:
-        _flush_autoread_timings_safely(
-            disourse=disourse,
-            topic_id=topic_id,
-            topic_slug=topic_slug,
-            batch=timing_batch,
-        )
 
     return {
         "topic_id": topic_id,
@@ -956,6 +965,38 @@ def _wait_for_autoread(stop_event: threading.Event | None, seconds: float) -> bo
         time.sleep(seconds)
         return False
     return stop_event.wait(seconds)
+
+
+def _simulate_autoread_post(
+    *,
+    disourse: DiscourseClient,
+    topic_id: int,
+    topic_slug: str,
+    post_number: int,
+    stop_event: threading.Event | None,
+    post_time_seconds: float,
+) -> bool:
+    remaining_seconds = max(0.0, float(post_time_seconds))
+    if remaining_seconds <= 0:
+        return False
+
+    while remaining_seconds > 0:
+        interval_seconds = min(remaining_seconds, AUTOREAD_MAX_TIMING_SECONDS)
+        if _wait_for_autoread(stop_event, interval_seconds):
+            return True
+        _flush_autoread_timings_safely(
+            disourse=disourse,
+            topic_id=topic_id,
+            topic_slug=topic_slug,
+            batch=[
+                {
+                    "post_number": post_number,
+                    "duration_ms": _autoread_duration_ms(interval_seconds),
+                }
+            ],
+        )
+        remaining_seconds -= interval_seconds
+    return False
 
 
 def _load_topic_posts_with_fallback(
