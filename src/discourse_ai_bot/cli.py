@@ -58,7 +58,7 @@ AUTOREAD_DEFAULT_TOPIC_LIMIT = 5
 AUTOREAD_POST_CHUNK_SIZE = 50
 AUTOREAD_CYCLE_DELAY_SECONDS = 0.35
 AUTOREAD_MAX_TIMING_SECONDS = 120.0
-AUTOREAD_MAX_PARALLEL_TOPICS = 4
+AUTOREAD_MAX_PARALLEL_TOPICS = 5
 SLASH_COMMANDS = (
     "/help",
     "/health",
@@ -768,19 +768,25 @@ def _autoread_worker_loop(
             max_workers = max(1, min(AUTOREAD_MAX_PARALLEL_TOPICS, len(topic_items)))
             with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="discourse-ai-bot-autoread-topic") as executor:
                 future_to_topic: dict[object, tuple[int, str]] = {}
-                for item in topic_items:
+                pending_topics = iter(topic_items)
+
+                def submit_next() -> bool:
                     if stop_event.is_set():
-                        break
+                        return False
+                    try:
+                        item = next(pending_topics)
+                    except StopIteration:
+                        return False
                     topic_id = int(item["topic_id"])
                     title = str(item.get("title") or f"Topic {topic_id}")
                     posts_count = item.get("posts_count")
                     if isinstance(posts_count, int) and posts_count > 0:
-                        ui.print_muted(
-                            f"AutoRead cycle {cycle_number}: Starting {title} ({posts_count} planned posts)"
+                        ui.print_autoread_queued(
+                            f"AutoRead cycle {cycle_number}: {title} ({posts_count} planned posts)"
                         )
                     else:
-                        ui.print_muted(
-                            f"AutoRead cycle {cycle_number}: Starting {title}"
+                        ui.print_autoread_queued(
+                            f"AutoRead cycle {cycle_number}: {title}"
                         )
                     future = executor.submit(
                         _read_topic_via_api,
@@ -793,6 +799,11 @@ def _autoread_worker_loop(
                         ),
                     )
                     future_to_topic[future] = (topic_id, title)
+                    return True
+
+                for _ in range(max_workers):
+                    if not submit_next():
+                        break
                 while future_to_topic and not stop_event.is_set():
                     done, _pending = wait(
                         list(future_to_topic.keys()),
@@ -808,13 +819,15 @@ def _autoread_worker_loop(
                         except Exception as exc:
                             logger.exception("AutoRead topic %s failed: %s", topic_id, exc)
                             ui.print_error(f"AutoRead topic {topic_id} failed, see logs above.")
+                            submit_next()
                             continue
                         if topic_result["posts_read"] > 0:
-                            ui.print_muted(
+                            ui.print_autoread_read(
                                 f"AutoRead cycle {cycle_number}: {topic_result['title']} "
                                 f"({topic_result['posts_read']} posts)"
                             )
                             results.append(topic_result)
+                        submit_next()
             if results:
                 ui.print_autoread_summary(
                     {
@@ -1332,6 +1345,18 @@ class _TerminalUI:
             self.console.print(f"[grey62]{text}[/grey62]")
             return
         print(text, flush=True)
+
+    def print_autoread_queued(self, text: str) -> None:
+        if self.console is not None:
+            self.console.print(f"[bold white on yellow4] QUEUED [/bold white on yellow4] {text}")
+            return
+        print(f"QUEUED {text}", flush=True)
+
+    def print_autoread_read(self, text: str) -> None:
+        if self.console is not None:
+            self.console.print(f"[bold white on green4] READ [/bold white on green4] {text}")
+            return
+        print(f"READ {text}", flush=True)
 
     def print_json(self, value: Any) -> None:
         text = json.dumps(value, indent=2)

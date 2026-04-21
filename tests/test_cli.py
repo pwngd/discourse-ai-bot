@@ -7,6 +7,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from discourse_ai_bot.cli import (
+    AUTOREAD_MAX_PARALLEL_TOPICS,
     _InteractiveState,
     _TerminalUI,
     _autoread_worker_loop,
@@ -669,10 +670,77 @@ class CliTests(unittest.TestCase):
         ui = _TerminalUI()
         with (
             patch("discourse_ai_bot.cli._wait_for_autoread", side_effect=fake_wait),
-            patch.object(ui, "print_muted") as print_muted,
+            patch.object(ui, "print_autoread_queued") as print_autoread_queued,
         ):
             _autoread_worker_loop(FakeDiscourse(), None, stop_event, 120.0)  # type: ignore[arg-type]
 
         self.assertTrue(
-            any("Starting Broken topic" in str(call.args[0]) for call in print_muted.call_args_list)
+            any("Broken topic" in str(call.args[0]) for call in print_autoread_queued.call_args_list)
         )
+
+    def test_autoread_worker_loop_only_queues_max_parallel_topics_initially(self) -> None:
+        class FakeDiscourse:
+            def list_categories(self) -> list[dict[str, object]]:
+                return []
+
+            def list_latest_topics(self, *, per_page: int = 5) -> dict[str, object]:
+                return {
+                    "topic_list": {
+                        "topics": [
+                            {"id": 100 + index, "title": f"Topic {index}"}
+                            for index in range(7)
+                        ]
+                    }
+                }
+
+        class FakeFuture:
+            def __init__(self, topic_id: int) -> None:
+                self.topic_id = topic_id
+
+            def result(self) -> dict[str, object]:
+                return {
+                    "title": f"Topic {self.topic_id}",
+                    "posts_read": 1,
+                    "authors": [],
+                }
+
+        state = {"submitted": 0, "first_wait_seen": None}
+
+        class FakeExecutor:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                self.futures: list[FakeFuture] = []
+
+            def __enter__(self) -> "FakeExecutor":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def submit(self, fn, **kwargs: object) -> FakeFuture:
+                state["submitted"] += 1
+                future = FakeFuture(int(kwargs["topic_id"]))
+                self.futures.append(future)
+                return future
+
+        stop_event = threading.Event()
+
+        def fake_wait(futures, timeout=None, return_when=None):
+            if state["first_wait_seen"] is None:
+                state["first_wait_seen"] = len(list(futures))
+            done = {list(futures)[0]}
+            if state["submitted"] >= 7 and len(list(futures)) == 1:
+                stop_event.set()
+            return done, set(list(futures)[1:])
+
+        ui = _TerminalUI()
+        with (
+            patch("discourse_ai_bot.cli.ThreadPoolExecutor", FakeExecutor),
+            patch("discourse_ai_bot.cli.wait", side_effect=fake_wait),
+            patch("discourse_ai_bot.cli._read_topic_via_api", return_value={"title": "Done", "posts_read": 1, "authors": []}),
+            patch("discourse_ai_bot.cli._wait_for_autoread", return_value=True),
+            patch.object(ui, "print_autoread_queued"),
+            patch.object(ui, "print_autoread_read"),
+        ):
+            _autoread_worker_loop(FakeDiscourse(), None, stop_event, 120.0)  # type: ignore[arg-type]
+
+        self.assertEqual(state["first_wait_seen"], AUTOREAD_MAX_PARALLEL_TOPICS)
