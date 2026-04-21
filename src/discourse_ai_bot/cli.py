@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from discourse_ai_bot.discourse import DiscourseClient
@@ -788,6 +788,9 @@ def _autoread_worker_loop(
                         topic_id=topic_id,
                         stop_event=stop_event,
                         post_time_seconds=post_time_seconds,
+                        progress_callback=lambda title, current, total, cycle=cycle_number: ui.print_muted(
+                            f"AutoRead cycle {cycle}: Reading {title} post {current}/{total}"
+                        ),
                     )
                     future_to_topic[future] = (topic_id, title)
                 while future_to_topic and not stop_event.is_set():
@@ -894,6 +897,7 @@ def _read_topic_via_api(
     topic_id: int,
     stop_event: threading.Event | None = None,
     post_time_seconds: float = 120.0,
+    progress_callback: Callable[[str, int, int], None] | None = None,
 ) -> dict[str, Any]:
     topic = disourse.get_topic(topic_id)
     title = str(topic.get("title", f"Topic {topic_id}"))
@@ -909,6 +913,7 @@ def _read_topic_via_api(
     ordered_ids = [int(post_id) for post_id in stream if isinstance(post_id, int)]
     if not ordered_ids:
         ordered_ids = sorted(posts_by_id.keys())
+    total_posts = len(ordered_ids)
 
     read_posts: list[dict[str, Any]] = []
     index = 0
@@ -934,6 +939,8 @@ def _read_topic_via_api(
         post = posts_by_id.get(current_id)
         if isinstance(post, dict):
             post_number = int(post.get("post_number", len(read_posts) + 1))
+            if progress_callback is not None:
+                progress_callback(title, len(read_posts) + 1, total_posts)
             read_posts.append(
                 {
                     "post_id": int(post["id"]),
@@ -1282,7 +1289,7 @@ class _TerminalUI:
         if self.console is not None and Panel is not None:
             self.console.print(Panel.fit(f"[bold cyan]{title}[/bold cyan]", border_style="cyan"))
             return
-        print(f"{title}.")
+        print(f"{title}.", flush=True)
 
     def print_health(self, health: dict[str, Any]) -> None:
         if self.console is not None and Table is not None:
@@ -1298,39 +1305,40 @@ class _TerminalUI:
             "Health: "
             f"Discourse={health['discourse_host']} as {health['discourse_username']} "
             f"(user_id={health['user_id']}), Ollama={health['ollama_model']}, "
-            f"typing={health['typing_mode']}"
+            f"typing={health['typing_mode']}",
+            flush=True,
         )
 
     def print_status(self, text: str) -> None:
         if self.console is not None:
             self.console.print(f"[bold green]{text}[/bold green]")
             return
-        print(text)
+        print(text, flush=True)
 
     def print_success(self, text: str) -> None:
         if self.console is not None:
             self.console.print(f"[bold green]{text}[/bold green]")
             return
-        print(text)
+        print(text, flush=True)
 
     def print_error(self, text: str) -> None:
         if self.console is not None:
             self.console.print(f"[bold red]{text}[/bold red]")
             return
-        print(text)
+        print(text, flush=True)
 
     def print_muted(self, text: str) -> None:
         if self.console is not None:
             self.console.print(f"[grey62]{text}[/grey62]")
             return
-        print(text)
+        print(text, flush=True)
 
     def print_json(self, value: Any) -> None:
         text = json.dumps(value, indent=2)
         if self.console is not None:
             self.console.print_json(text)
             return
-        print(text)
+        print(text, flush=True)
 
     def print_stats(self, stats: dict[str, Any]) -> None:
         if self.console is not None and Table is not None and Panel is not None:
@@ -1381,37 +1389,39 @@ class _TerminalUI:
             self.console.print(handled_table)
             return
 
-        print("Bot Stats")
-        print(f"Bot: {stats.get('identity', {}).get('username')} (user_id={stats.get('identity', {}).get('user_id')})")
-        print(f"Model: {stats.get('runtime', {}).get('model')}")
-        print(f"Typing: {stats.get('runtime', {}).get('typing_mode')}")
-        print(f"Polling: {stats.get('runtime', {}).get('poll_interval_seconds')}s")
+        print("Bot Stats", flush=True)
+        print(f"Bot: {stats.get('identity', {}).get('username')} (user_id={stats.get('identity', {}).get('user_id')})", flush=True)
+        print(f"Model: {stats.get('runtime', {}).get('model')}", flush=True)
+        print(f"Typing: {stats.get('runtime', {}).get('typing_mode')}", flush=True)
+        print(f"Polling: {stats.get('runtime', {}).get('poll_interval_seconds')}s", flush=True)
         print(
             "Delay: "
             f"{stats.get('runtime', {}).get('delay_min_seconds')}s - "
-            f"{stats.get('runtime', {}).get('delay_max_seconds')}s"
+            f"{stats.get('runtime', {}).get('delay_max_seconds')}s",
+            flush=True,
         )
         if stats.get("runtime", {}).get("autoread_post_time_seconds") is not None:
             print(
                 "AutoRead: "
-                f"{_format_duration(float(stats.get('runtime', {}).get('autoread_post_time_seconds', 0)))}"
+                f"{_format_duration(float(stats.get('runtime', {}).get('autoread_post_time_seconds', 0)))}",
+                flush=True,
             )
-        print(f"Pending notification replies: {stats.get('storage', {}).get('pending_replies')}")
-        print(f"Notification reply errors: {stats.get('storage', {}).get('pending_reply_errors')}")
-        print(f"Manual queued: {stats.get('storage', {}).get('manual_queued')}")
-        print(f"Manual scheduled: {stats.get('storage', {}).get('manual_scheduled')}")
-        print(f"Manual completed: {stats.get('storage', {}).get('manual_completed')}")
-        print(f"Manual errors: {stats.get('storage', {}).get('manual_errors')}")
-        print(f"Total handled: {stats.get('storage', {}).get('handled_total')}")
-        print(f"Replies sent: {stats.get('storage', {}).get('handled_replied')}")
-        print(f"Skipped: {stats.get('storage', {}).get('handled_skipped')}")
+        print(f"Pending notification replies: {stats.get('storage', {}).get('pending_replies')}", flush=True)
+        print(f"Notification reply errors: {stats.get('storage', {}).get('pending_reply_errors')}", flush=True)
+        print(f"Manual queued: {stats.get('storage', {}).get('manual_queued')}", flush=True)
+        print(f"Manual scheduled: {stats.get('storage', {}).get('manual_scheduled')}", flush=True)
+        print(f"Manual completed: {stats.get('storage', {}).get('manual_completed')}", flush=True)
+        print(f"Manual errors: {stats.get('storage', {}).get('manual_errors')}", flush=True)
+        print(f"Total handled: {stats.get('storage', {}).get('handled_total')}", flush=True)
+        print(f"Replies sent: {stats.get('storage', {}).get('handled_replied')}", flush=True)
+        print(f"Skipped: {stats.get('storage', {}).get('handled_skipped')}", flush=True)
 
     def print_summary(self, text: str) -> None:
         if self.console is not None and Panel is not None:
             body = Markdown(text) if Markdown is not None else text
             self.console.print(Panel(body, title="[bold cyan]Recent Summary[/bold cyan]", border_style="cyan"))
             return
-        print(text)
+        print(text, flush=True)
 
     def print_autoread_summary(self, result: dict[str, Any]) -> None:
         if self.console is not None and Table is not None and Panel is not None:
@@ -1438,18 +1448,18 @@ class _TerminalUI:
             self.console.print(topics_table)
             return
 
-        print(f"AutoRead source: {result.get('source')}")
-        print(f"Categories: {result.get('categories_count')}")
-        print(f"Topics read: {result.get('topics_read')}")
-        print(f"Posts read: {result.get('total_posts_read')}")
+        print(f"AutoRead source: {result.get('source')}", flush=True)
+        print(f"Categories: {result.get('categories_count')}", flush=True)
+        print(f"Topics read: {result.get('topics_read')}", flush=True)
+        print(f"Posts read: {result.get('total_posts_read')}", flush=True)
         for topic in result.get("topics", []):
-            print(f"- {topic.get('title')} ({topic.get('posts_read')} posts)")
+            print(f"- {topic.get('title')} ({topic.get('posts_read')} posts)", flush=True)
 
     def print_blank(self) -> None:
         if self.console is not None:
             self.console.print("")
             return
-        print()
+        print(flush=True)
 
     def print_help(self) -> None:
         if self.console is not None and Table is not None:

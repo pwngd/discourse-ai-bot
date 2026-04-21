@@ -487,6 +487,39 @@ class CliTests(unittest.TestCase):
         self.assertEqual(result["posts_read"], 3)
         self.assertEqual(result["authors"], ["alice", "bob", "carol"])
 
+    def test_read_topic_via_api_reports_per_post_progress(self) -> None:
+        class FakeDiscourse:
+            host = "https://forum.example.com"
+
+            def get_topic(self, topic_id: int) -> dict[str, object]:
+                return {
+                    "title": "Topic 100",
+                    "slug": "topic-100",
+                    "post_stream": {
+                        "stream": [900, 901],
+                        "posts": [
+                            {"id": 900, "post_number": 1, "username": "alice"},
+                            {"id": 901, "post_number": 2, "username": "bob"},
+                        ],
+                    },
+                }
+
+            def record_topic_timings(self, **kwargs: object) -> dict[str, object]:
+                return {"success": "OK"}
+
+        progress: list[tuple[str, int, int]] = []
+        with patch("discourse_ai_bot.cli.time.sleep"):
+            _read_topic_via_api(
+                disourse=FakeDiscourse(),  # type: ignore[arg-type]
+                topic_id=100,
+                progress_callback=lambda title, current, total: progress.append((title, current, total)),
+            )
+
+        self.assertEqual(
+            progress,
+            [("Topic 100", 1, 2), ("Topic 100", 2, 2)],
+        )
+
     def test_read_topic_via_api_flushes_timings_batches(self) -> None:
         class FakeDiscourse:
             host = "https://forum.example.com"
