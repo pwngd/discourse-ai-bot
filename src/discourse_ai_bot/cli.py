@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 from discourse_ai_bot.discourse import DiscourseClient
 from discourse_ai_bot.http import HttpError
-from discourse_ai_bot.ollama import OllamaClient
+from discourse_ai_bot.ollama import OllamaClient, ThinkingEvent
 from discourse_ai_bot.presence import DiscoursePresenceAdapter, NullPresenceAdapter
 from discourse_ai_bot.service import BotService
 from discourse_ai_bot.settings import Settings, load_settings
@@ -158,6 +158,7 @@ def main(argv: list[str] | None = None) -> int:
         settings.ollama_host,
         timeout_seconds=settings.ollama_timeout_seconds,
     )
+    _install_ollama_thinking_stream(ollama)
     storage = BotStorage(settings.database_path)
     presence = _build_presence_adapter(settings)
     service = BotService(
@@ -242,6 +243,7 @@ def _collect_health(
         "site_categories": len(site.get("categories", [])) if isinstance(site, dict) else None,
         "user_id": user_id,
         "ollama_model": model_info["model"],
+        "reasoning_capable": model_info.get("reasoning_capable"),
         "typing_mode": settings.bot_typing_mode,
     }
     return result
@@ -277,6 +279,12 @@ def _build_presence_adapter(settings: Settings) -> Any:
         user_agent=settings.discourse_presence_user_agent,
         extra_headers=settings.discourse_presence_extra_headers,
     )
+
+
+def _install_ollama_thinking_stream(ollama: object) -> None:
+    if not hasattr(ollama, "set_thinking_callback"):
+        return
+    getattr(ollama, "set_thinking_callback")(_TerminalUI().handle_thinking_event)
 
 
 def _now_storage() -> str:
@@ -1274,6 +1282,9 @@ class _TerminalUI:
         )
         self.history = InMemoryHistory() if InMemoryHistory is not None else None
         self._stream_active = False
+        self._private_stream_prefix_printed = False
+        self._thinking_stream_active = False
+        self._output_lock = threading.RLock()
         self.prompt_style = (
             PromptStyle.from_dict(
                 {
@@ -1298,67 +1309,120 @@ class _TerminalUI:
             except (NoConsoleScreenBufferError, EOFError, OSError):
                 self.session = None
 
+    def handle_thinking_event(self, event: ThinkingEvent) -> None:
+        with self._output_lock:
+            if event.kind == "start":
+                self._begin_thinking_stream()
+                return
+            if event.kind == "chunk":
+                if not self._thinking_stream_active:
+                    self._begin_thinking_stream()
+                self._print_thinking_chunk(event.chunk)
+                return
+            if event.kind == "end":
+                self._finish_thinking_stream()
+
+    def _begin_thinking_stream(self) -> None:
+        self._finish_thinking_stream()
+        if self.console is not None:
+            self.console.print("[grey35]thinking> [/grey35]", end="")
+        else:
+            print("thinking> ", end="", flush=True)
+        self._thinking_stream_active = True
+
+    def _print_thinking_chunk(self, chunk: str) -> None:
+        if not chunk:
+            return
+        if self.console is not None:
+            self.console.print(chunk, style="grey35", end="", highlight=False)
+            return
+        print(chunk, end="", flush=True)
+
+    def _finish_thinking_stream(self) -> None:
+        if not self._thinking_stream_active:
+            return
+        if self.console is not None:
+            self.console.print("")
+        else:
+            print()
+        self._thinking_stream_active = False
+
+    def _prepare_for_output(self) -> None:
+        self._finish_thinking_stream()
+
     def print_banner(self, title: str) -> None:
+        self._prepare_for_output()
         if self.console is not None and Panel is not None:
             self.console.print(Panel.fit(f"[bold cyan]{title}[/bold cyan]", border_style="cyan"))
             return
         print(f"{title}.", flush=True)
 
     def print_health(self, health: dict[str, Any]) -> None:
+        self._prepare_for_output()
         if self.console is not None and Table is not None:
             table = Table(show_header=False, box=None, pad_edge=False)
             table.add_column(style="bold cyan")
             table.add_column(style="white")
             table.add_row("Discourse", f"{health['discourse_host']} as {health['discourse_username']} (user_id={health['user_id']})")
             table.add_row("Ollama", str(health["ollama_model"]))
+            if health.get("reasoning_capable") is not None:
+                table.add_row("Reasoning", "enabled" if health.get("reasoning_capable") else "disabled")
             table.add_row("Typing", str(health["typing_mode"]))
             self.console.print(table)
             return
         print(
             "Health: "
             f"Discourse={health['discourse_host']} as {health['discourse_username']} "
-            f"(user_id={health['user_id']}), Ollama={health['ollama_model']}, "
+            f"(user_id={health['user_id']}), Ollama={health['ollama_model']}"
+            f"{', reasoning=' + ('enabled' if health.get('reasoning_capable') else 'disabled') if health.get('reasoning_capable') is not None else ''}, "
             f"typing={health['typing_mode']}",
             flush=True,
         )
 
     def print_status(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print(f"[bold green]{text}[/bold green]")
             return
         print(text, flush=True)
 
     def print_success(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print(f"[bold green]{text}[/bold green]")
             return
         print(text, flush=True)
 
     def print_error(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print(f"[bold red]{text}[/bold red]")
             return
         print(text, flush=True)
 
     def print_muted(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print(f"[grey62]{text}[/grey62]")
             return
         print(text, flush=True)
 
     def print_autoread_queued(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print(f"[bold white on yellow4] QUEUED [/bold white on yellow4] {text}")
             return
         print(f"QUEUED {text}", flush=True)
 
     def print_autoread_read(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print(f"[bold white on green4] READ [/bold white on green4] {text}")
             return
         print(f"READ {text}", flush=True)
 
     def print_json(self, value: Any) -> None:
+        self._prepare_for_output()
         text = json.dumps(value, indent=2)
         if self.console is not None:
             self.console.print_json(text)
@@ -1366,6 +1430,7 @@ class _TerminalUI:
         print(text, flush=True)
 
     def print_stats(self, stats: dict[str, Any]) -> None:
+        self._prepare_for_output()
         if self.console is not None and Table is not None and Panel is not None:
             identity = stats.get("identity", {})
             runtime = stats.get("runtime", {})
@@ -1442,6 +1507,7 @@ class _TerminalUI:
         print(f"Skipped: {stats.get('storage', {}).get('handled_skipped')}", flush=True)
 
     def print_summary(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None and Panel is not None:
             body = Markdown(text) if Markdown is not None else text
             self.console.print(Panel(body, title="[bold cyan]Recent Summary[/bold cyan]", border_style="cyan"))
@@ -1449,6 +1515,7 @@ class _TerminalUI:
         print(text, flush=True)
 
     def print_autoread_summary(self, result: dict[str, Any]) -> None:
+        self._prepare_for_output()
         if self.console is not None and Table is not None and Panel is not None:
             summary = Table(show_header=False, box=None, pad_edge=False)
             summary.add_column(style="bold cyan")
@@ -1481,12 +1548,14 @@ class _TerminalUI:
             print(f"- {topic.get('title')} ({topic.get('posts_read')} posts)", flush=True)
 
     def print_blank(self) -> None:
+        self._prepare_for_output()
         if self.console is not None:
             self.console.print("")
             return
         print(flush=True)
 
     def print_help(self) -> None:
+        self._prepare_for_output()
         if self.console is not None and Table is not None:
             table = Table(title="Commands", header_style="bold cyan")
             table.add_column("Command", style="bold white")
@@ -1545,6 +1614,7 @@ class _TerminalUI:
         print("/config mark-read <on|off>")
 
     def print_private_reply(self, text: str) -> None:
+        self._prepare_for_output()
         if self.console is not None and Panel is not None:
             self.console.print(Panel.fit(text, title="[bold magenta]Private Chat[/bold magenta]", border_style="magenta"))
             return
@@ -1567,15 +1637,14 @@ class _TerminalUI:
         return input(f"{label}> ")
 
     def begin_private_stream(self) -> None:
+        self._prepare_for_output()
         self._stream_active = True
-        if self.console is not None:
-            self.console.print("[bold magenta]AI[/bold magenta]: ", end="")
-            return
-        print("AI: ", end="", flush=True)
+        self._private_stream_prefix_printed = False
 
     def stream_private_chunk(self, chunk: str) -> None:
         if not chunk:
             return
+        self._ensure_private_stream_prefix()
         if self.console is not None:
             self.console.print(chunk, style="magenta", end="", highlight=False)
             return
@@ -1584,8 +1653,20 @@ class _TerminalUI:
     def end_private_stream(self) -> None:
         if not self._stream_active:
             return
-        if self.console is not None:
-            self.console.print("")
-        else:
-            print()
+        if self._private_stream_prefix_printed:
+            if self.console is not None:
+                self.console.print("")
+            else:
+                print()
         self._stream_active = False
+        self._private_stream_prefix_printed = False
+
+    def _ensure_private_stream_prefix(self) -> None:
+        if self._private_stream_prefix_printed:
+            return
+        self._prepare_for_output()
+        if self.console is not None:
+            self.console.print("[bold magenta]AI[/bold magenta]: ", end="")
+        else:
+            print("AI: ", end="", flush=True)
+        self._private_stream_prefix_printed = True

@@ -7,6 +7,7 @@ from collections import deque
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from discourse_ai_bot.classifier import DEFAULT_NOTIFICATION_TYPES, NotificationClassifier
 from discourse_ai_bot.context import ContextResolver
@@ -620,8 +621,8 @@ class BotService:
             self.logger.warning("Failed to upload GIF '%s': %s", option.gif_id, exc)
             return None
 
-        raw_url = response.get("url") if isinstance(response, dict) else None
-        if not isinstance(raw_url, str) or not raw_url.strip():
+        upload_reference = self._normalize_upload_reference(response)
+        if upload_reference is None:
             self._record_activity(
                 f"Upload response for GIF '{option.gif_id}' did not include a URL. Sending text only.",
                 level="warning",
@@ -631,9 +632,28 @@ class BotService:
                 option.gif_id,
             )
             return None
-        if raw_url.startswith(("http://", "https://")):
-            return raw_url
-        return f"{self.settings.discourse_host.rstrip('/')}/{raw_url.lstrip('/')}"
+        return upload_reference
+
+    def _normalize_upload_reference(self, response: object) -> str | None:
+        if not isinstance(response, dict):
+            return None
+
+        for key in ("short_url", "url", "short_path"):
+            raw_value = response.get(key)
+            if not isinstance(raw_value, str):
+                continue
+            candidate = raw_value.strip()
+            if not candidate:
+                continue
+            if candidate.startswith("upload://"):
+                return candidate
+            if candidate.startswith(("http://", "https://")):
+                return candidate
+            if candidate.startswith("//"):
+                scheme = urlsplit(self.settings.discourse_host).scheme or "https"
+                return f"{scheme}:{candidate}"
+            return f"{self.settings.discourse_host.rstrip('/')}/{candidate.lstrip('/')}"
+        return None
 
     def _record_activity(self, message: str, *, level: str = "info") -> None:
         self.activity_events.append(

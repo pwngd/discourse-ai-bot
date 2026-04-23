@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 
 from discourse_ai_bot.models import BotIdentity, TopicContext, TopicPost
-from discourse_ai_bot.ollama import OllamaClient, OllamaResponseError
+from discourse_ai_bot.ollama import (
+    OllamaClient,
+    OllamaResponseError,
+    ThinkingEvent,
+    _build_manual_request_prompt,
+)
 
 
 class FakeTransport:
@@ -47,15 +52,23 @@ class OllamaTests(unittest.TestCase):
 
     def test_decide_parses_valid_json_response(self) -> None:
         client = OllamaClient("http://localhost:11434")
-        client.http = FakeTransport(
+        transport = FakeTransport(
             {
-                ("POST", "/chat"): {
-                    "message": {
-                        "content": '{"action":"reply","reply_markdown":"Thanks!","reason":"Direct mention","gif_id":"friendly_wave"}'
-                    }
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
                 }
             }
         )
+        transport.stream_responses[("POST", "/chat")] = [
+            {
+                "message": {
+                    "content": '{"action":"reply","reply_markdown":"Thanks!","reason":"Direct mention","gif_id":"friendly_wave"}'
+                }
+            },
+            {"done": True},
+        ]
+        client.http = transport
         decision = client.decide(
             model="qwen3",
             system_prompt="Prompt",
@@ -67,21 +80,25 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual(decision.action, "reply")
         self.assertEqual(decision.reply_markdown, "Thanks!")
         self.assertEqual(decision.gif_id, "friendly_wave")
-        method, path, kwargs = client.http.calls[0]
+        method, path, kwargs = transport.stream_calls[0]
         self.assertEqual((method, path), ("POST", "/chat"))
-        self.assertFalse(kwargs["json_body"]["stream"])
+        self.assertTrue(kwargs["json_body"]["stream"])
 
     def test_decide_rejects_invalid_action(self) -> None:
         client = OllamaClient("http://localhost:11434")
-        client.http = FakeTransport(
+        transport = FakeTransport(
             {
-                ("POST", "/chat"): {
-                    "message": {
-                        "content": '{"action":"maybe","reply_markdown":"","reason":"Nope"}'
-                    }
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
                 }
             }
-            )
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": '{"action":"maybe","reply_markdown":"","reason":"Nope"}'}},
+            {"done": True},
+        ]
+        client.http = transport
         with self.assertRaises(OllamaResponseError):
             client.decide(
                 model="qwen3",
@@ -92,15 +109,19 @@ class OllamaTests(unittest.TestCase):
 
     def test_compose_manual_reply_requires_reply_action(self) -> None:
         client = OllamaClient("http://localhost:11434")
-        client.http = FakeTransport(
+        transport = FakeTransport(
             {
-                ("POST", "/chat"): {
-                    "message": {
-                        "content": '{"action":"reply","reply_markdown":"On it.","reason":"Operator request"}'
-                    }
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
                 }
             }
         )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": '{"action":"reply","reply_markdown":"On it.","reason":"Operator request"}'}},
+            {"done": True},
+        ]
+        client.http = transport
 
         decision = client.compose_manual_reply(
             model="qwen3",
@@ -113,17 +134,41 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual(decision.action, "reply")
         self.assertEqual(decision.reply_markdown, "On it.")
 
+    def test_manual_request_prompt_marks_gif_as_required_when_requested(self) -> None:
+        prompt = _build_manual_request_prompt(
+            self.identity,
+            self.context,
+            "Reply with a gif if it fits.",
+            available_gifs=[],
+        )
+
+        self.assertIn("Operator GIF requirement: required", prompt)
+
+    def test_manual_request_prompt_marks_gif_as_optional_when_not_requested(self) -> None:
+        prompt = _build_manual_request_prompt(
+            self.identity,
+            self.context,
+            "Reply briefly and disagree.",
+            available_gifs=[],
+        )
+
+        self.assertIn("Operator GIF requirement: optional.", prompt)
+
     def test_chat_returns_plain_content(self) -> None:
         client = OllamaClient("http://localhost:11434")
-        client.http = FakeTransport(
+        transport = FakeTransport(
             {
-                ("POST", "/chat"): {
-                    "message": {
-                        "content": "Private operator response."
-                    }
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
                 }
             }
         )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": "Private operator response."}},
+            {"done": True},
+        ]
+        client.http = transport
 
         content = client.chat(
             model="qwen3",
@@ -135,7 +180,14 @@ class OllamaTests(unittest.TestCase):
 
     def test_chat_stream_yields_incremental_content(self) -> None:
         client = OllamaClient("http://localhost:11434")
-        transport = FakeTransport({})
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
         transport.stream_responses[("POST", "/chat")] = [
             {"message": {"content": "Private "}, "done": False},
             {"message": {"content": "operator "}, "done": False},
@@ -158,17 +210,111 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual((method, path), ("POST", "/chat"))
         self.assertTrue(kwargs["json_body"]["stream"])
 
-    def test_summarize_activity_returns_markdown_summary(self) -> None:
+    def test_decide_emits_global_thinking_events(self) -> None:
         client = OllamaClient("http://localhost:11434")
-        client.http = FakeTransport(
+        transport = FakeTransport(
             {
-                ("POST", "/chat"): {
-                    "message": {
-                        "content": "Summary sentence.\n\n## Recent Activity\n- Did a thing."
-                    }
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
                 }
             }
         )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"thinking": "Inspect context. "}},
+            {"message": {"thinking": "Draft response. "}},
+            {"message": {"content": '{"action":"reply","reply_markdown":"Done.","reason":"Helpful"}'}},
+            {"done": True},
+        ]
+        client.http = transport
+        events: list[ThinkingEvent] = []
+        client.set_thinking_callback(events.append)
+
+        decision = client.decide(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=self.context,
+        )
+
+        self.assertEqual(decision.reply_markdown, "Done.")
+        self.assertEqual(
+            [(event.kind, event.chunk) for event in events],
+            [
+                ("start", ""),
+                ("chunk", "Inspect context. "),
+                ("chunk", "Draft response. "),
+                ("end", ""),
+            ],
+        )
+
+    def test_supports_thinking_uses_show_model_capabilities(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        client.http = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+
+        self.assertTrue(client.supports_thinking("qwen3"))
+        method, path, kwargs = client.http.calls[0]
+        self.assertEqual((method, path), ("POST", "/show"))
+        self.assertEqual(kwargs["json_body"], {"model": "qwen3"})
+
+    def test_chat_stream_yields_reasoning_chunks_for_thinking_models(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"thinking": "Plan "}, "done": False},
+            {"message": {"thinking": "steps. "}, "done": False},
+            {"message": {"content": "Final answer."}, "done": False},
+            {"done": True},
+        ]
+        client.http = transport
+        chunks: list[str] = []
+        thinking_chunks: list[str] = []
+
+        content = client.chat_stream(
+            model="qwen3",
+            system_prompt="Private prompt",
+            messages=[{"role": "user", "content": "Hello"}],
+            on_chunk=chunks.append,
+            on_thinking_chunk=thinking_chunks.append,
+        )
+
+        self.assertEqual(content, "Final answer.")
+        self.assertEqual(chunks, ["Final answer."])
+        self.assertEqual(thinking_chunks, ["Plan ", "steps. "])
+        method, path, kwargs = transport.stream_calls[0]
+        self.assertEqual((method, path), ("POST", "/chat"))
+        self.assertTrue(kwargs["json_body"]["stream"])
+        self.assertTrue(kwargs["json_body"]["think"])
+
+    def test_summarize_activity_returns_markdown_summary(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": "Summary sentence.\n\n## Recent Activity\n- Did a thing."}},
+            {"done": True},
+        ]
+        client.http = transport
 
         summary = client.summarize_activity(
             model="qwen3",
@@ -183,6 +329,6 @@ class OllamaTests(unittest.TestCase):
         )
 
         self.assertIn("## Recent Activity", summary)
-        method, path, kwargs = client.http.calls[0]
+        method, path, kwargs = transport.stream_calls[0]
         self.assertEqual((method, path), ("POST", "/chat"))
-        self.assertFalse(kwargs["json_body"]["stream"])
+        self.assertTrue(kwargs["json_body"]["stream"])

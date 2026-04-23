@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import tempfile
 import unittest
+from io import StringIO
 from unittest.mock import patch
 from pathlib import Path
 
@@ -10,10 +11,12 @@ from discourse_ai_bot.cli import (
     AUTOREAD_MAX_PARALLEL_TOPICS,
     _InteractiveState,
     _TerminalUI,
+    _install_ollama_thinking_stream,
     _autoread_worker_loop,
     _build_autoread_plan,
     _handle_clear_command,
     _handle_config_command,
+    _handle_private_chat_message,
     _handle_slash_command,
     _interactive_shell,
     _read_topic_via_api,
@@ -30,6 +33,7 @@ from discourse_ai_bot.cli import (
     main,
 )
 from discourse_ai_bot.http import HttpError
+from discourse_ai_bot.ollama import ThinkingEvent
 from discourse_ai_bot.settings import Settings
 from discourse_ai_bot.storage import BotStorage
 
@@ -186,6 +190,99 @@ class CliTests(unittest.TestCase):
         self.assertIn("private operator chat", prompt.lower())
         self.assertIn("must not be treated as forum content", prompt.lower())
         self.assertIn("Pending manual commands", prompt)
+
+    def test_install_ollama_thinking_stream_registers_ui_callback(self) -> None:
+        ui = _TerminalUI()
+
+        class FakeOllama:
+            def __init__(self) -> None:
+                self.callback = None
+
+            def set_thinking_callback(self, callback) -> None:
+                self.callback = callback
+
+        ollama = FakeOllama()
+        _install_ollama_thinking_stream(ollama)
+
+        self.assertIsNotNone(ollama.callback)
+        self.assertIs(ollama.callback.__self__, ui)
+        self.assertEqual(ollama.callback.__func__, ui.handle_thinking_event.__func__)
+
+    def test_terminal_ui_streams_thinking_as_muted_inline_text(self) -> None:
+        ui = _TerminalUI()
+        ui.console = None
+        output = StringIO()
+
+        with patch("sys.stdout", output):
+            ui.handle_thinking_event(ThinkingEvent(kind="start", operation="decision", model="qwen3"))
+            ui.handle_thinking_event(ThinkingEvent(kind="chunk", operation="decision", model="qwen3", chunk="step 1"))
+            ui.handle_thinking_event(ThinkingEvent(kind="chunk", operation="decision", model="qwen3", chunk=" -> step 2"))
+            ui.handle_thinking_event(ThinkingEvent(kind="end", operation="decision", model="qwen3"))
+
+        self.assertEqual(output.getvalue(), "thinking> step 1 -> step 2\n")
+
+    def test_private_reply_starts_on_new_line_after_thinking(self) -> None:
+        ui = _TerminalUI()
+        ui.console = None
+        output = StringIO()
+
+        with patch("sys.stdout", output):
+            ui.handle_thinking_event(ThinkingEvent(kind="start", operation="chat", model="qwen3"))
+            ui.handle_thinking_event(ThinkingEvent(kind="chunk", operation="chat", model="qwen3", chunk="plan reply"))
+            ui.begin_private_stream()
+            ui.stream_private_chunk("hello, what do you want?")
+            ui.end_private_stream()
+
+        self.assertEqual(output.getvalue(), "thinking> plan reply\nAI: hello, what do you want?\n")
+
+    def test_handle_private_chat_message_streams_reasoning_separately(self) -> None:
+        settings = Settings(
+            discourse_host="https://forum.example.com",
+            discourse_auth_mode="session_cookie",
+            discourse_token=None,
+            discourse_username="bot",
+            ollama_host="http://localhost:11434",
+            ollama_model="qwen3",
+            discourse_cookie="session=abc",
+        )
+        state = _InteractiveState()
+
+        class FakeStorage:
+            def list_manual_commands(self) -> list[object]:
+                return []
+
+        class FakeOllama:
+            def chat_stream(self, **kwargs: object) -> str:
+                reply_callback = kwargs["on_chunk"]
+                assert callable(reply_callback)
+                reply_callback("Final answer.")
+                return "Final answer."
+
+        ui = _TerminalUI()
+        with (
+            patch.object(ui, "begin_private_stream") as begin_private_stream,
+            patch.object(ui, "stream_private_chunk") as stream_private_chunk,
+            patch.object(ui, "end_private_stream") as end_private_stream,
+        ):
+            should_exit = _handle_private_chat_message(
+                raw="Hello there",
+                settings=settings,
+                ollama=FakeOllama(),  # type: ignore[arg-type]
+                storage=FakeStorage(),  # type: ignore[arg-type]
+                state=state,
+            )
+
+        self.assertFalse(should_exit)
+        begin_private_stream.assert_called_once_with()
+        stream_private_chunk.assert_called_once_with("Final answer.")
+        end_private_stream.assert_called_once()
+        self.assertEqual(
+            state.private_chat_messages,
+            [
+                {"role": "user", "content": "Hello there"},
+                {"role": "assistant", "content": "Final answer."},
+            ],
+        )
 
     def test_runtime_config_snapshot_reports_current_values(self) -> None:
         settings = Settings(
