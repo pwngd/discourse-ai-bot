@@ -116,6 +116,23 @@ class ModelDecision:
 
 
 @dataclass(frozen=True)
+class AutonomousCandidate:
+    post_url: str
+    topic_id: int
+    post_number: int
+    actor_username: str | None
+    context: TopicContext
+
+
+@dataclass(frozen=True)
+class AutonomousSelection:
+    action: str
+    post_url: str | None
+    confidence: float
+    reason: str
+
+
+@dataclass(frozen=True)
 class PendingJob:
     notification_id: int
     topic_id: int

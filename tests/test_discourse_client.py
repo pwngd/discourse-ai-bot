@@ -189,6 +189,19 @@ class DiscourseClientTests(unittest.TestCase):
         self.assertEqual(target["slug"], "support")
         self.assertEqual(target["category_id"], 7)
 
+    def test_resolve_category_url_supports_subcategory_links(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="api_key",
+            token="token",
+            username="bot",
+        )
+
+        target = client.resolve_category_url("https://forum.example.com/c/parent/support/17")
+
+        self.assertEqual(target["slug"], "support")
+        self.assertEqual(target["category_id"], 17)
+
     def test_list_latest_topics_uses_documented_endpoint(self) -> None:
         client = DiscourseClient(
             "https://forum.example.com",
@@ -207,6 +220,25 @@ class DiscourseClientTests(unittest.TestCase):
         payload = client.list_latest_topics(per_page=5)
 
         self.assertEqual(payload["topic_list"]["topics"][0]["id"], 100)
+
+    def test_list_latest_topics_supports_page_parameter(self) -> None:
+        client = DiscourseClient(
+            "https://forum.example.com",
+            auth_mode="api_key",
+            token="token",
+            username="bot",
+        )
+        client.http = FakeTransport(
+            {
+                ("GET", "/latest.json?per_page=30&page=1"): {
+                    "topic_list": {"topics": [{"id": 101, "title": "Next page"}]}
+                }
+            }
+        )
+
+        payload = client.list_latest_topics(per_page=30, page=1)
+
+        self.assertEqual(payload["topic_list"]["topics"][0]["id"], 101)
 
     def test_get_topic_posts_uses_specific_posts_endpoint(self) -> None:
         client = DiscourseClient(

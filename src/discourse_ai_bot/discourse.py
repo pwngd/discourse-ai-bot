@@ -82,8 +82,11 @@ class DiscourseClient:
         )
         return response if isinstance(response, dict) else {}
 
-    def list_latest_topics(self, *, per_page: int = 5) -> dict[str, Any]:
-        response = self.http.request_json("GET", f"/latest.json?per_page={per_page}")
+    def list_latest_topics(self, *, per_page: int = 5, page: int | None = None) -> dict[str, Any]:
+        query = {"per_page": per_page}
+        if page is not None:
+            query["page"] = page
+        response = self.http.request_json("GET", f"/latest.json?{urlencode(query)}")
         return response if isinstance(response, dict) else {}
 
     def list_category_topics(self, *, slug: str, category_id: int) -> dict[str, Any]:
@@ -289,10 +292,14 @@ class DiscourseClient:
     def resolve_category_url(self, category_url: str) -> dict[str, str | int]:
         path = urlsplit(category_url).path or category_url
         segments = [segment for segment in path.split("/") if segment]
-        if len(segments) >= 3 and segments[0] == "c" and segments[2].isdigit():
+        if len(segments) >= 2 and segments[0] == "c":
+            numeric_segments = [segment for segment in segments[1:] if segment.isdigit()]
+            if not numeric_segments:
+                raise ValueError(f"Unsupported Discourse category URL: {category_url}")
+            slug_segments = [segment for segment in segments[1:] if not segment.isdigit()]
             return {
-                "slug": segments[1],
-                "category_id": int(segments[2]),
+                "slug": slug_segments[-1] if slug_segments else "",
+                "category_id": int(numeric_segments[-1]),
             }
         raise ValueError(f"Unsupported Discourse category URL: {category_url}")
 

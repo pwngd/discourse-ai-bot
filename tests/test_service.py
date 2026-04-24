@@ -8,7 +8,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from discourse_ai_bot.gifs import GifOption
-from discourse_ai_bot.models import ModelDecision, Notification
+from discourse_ai_bot.models import AutonomousSelection, ModelDecision, Notification
 from discourse_ai_bot.presence import NullPresenceAdapter
 from discourse_ai_bot.service import BotService
 from discourse_ai_bot.settings import Settings
@@ -39,7 +39,12 @@ class FakeDiscourseClient:
                 "mentioned": 1,
                 "replied": 2,
                 "private_message": 6,
-            }
+            },
+            "categories": [
+                {"id": 10, "slug": "restricted", "parent_category_id": None},
+                {"id": 11, "slug": "child-restricted", "parent_category_id": 10},
+                {"id": 20, "slug": "support", "parent_category_id": None},
+            ],
         }
         self.session_payload = {"current_user": {"id": 77, "username": "bot", "name": "Bot"}}
         self.user_payload = {"user": {"id": 77, "username": "bot", "name": "Bot"}}
@@ -47,6 +52,7 @@ class FakeDiscourseClient:
             100: {
                 "title": "Topic 100",
                 "slug": "topic-100",
+                "archetype": "regular",
                 "post_stream": {
                     "posts": [
                         {
@@ -82,6 +88,38 @@ class FakeDiscourseClient:
                     ]
                 },
             },
+            300: {
+                "title": "Latest support question",
+                "slug": "latest-support-question",
+                "archetype": "regular",
+                "post_stream": {
+                    "posts": [
+                        {
+                            "id": 1100,
+                            "topic_id": 300,
+                            "post_number": 1,
+                            "username": "charlie",
+                            "cooked": "<p>Does anyone know how to configure this?</p>",
+                        }
+                    ]
+                },
+            },
+            301: {
+                "title": "Allowed followup question",
+                "slug": "allowed-followup-question",
+                "archetype": "regular",
+                "post_stream": {
+                    "posts": [
+                        {
+                            "id": 1101,
+                            "topic_id": 301,
+                            "post_number": 1,
+                            "username": "dana",
+                            "cooked": "<p>Can someone explain the supported path?</p>",
+                        }
+                    ]
+                },
+            },
         }
         self.posts = {
             901: {
@@ -98,8 +136,38 @@ class FakeDiscourseClient:
                 "username": "alice",
                 "cooked": "<p>Private ping</p>",
             },
+            1100: {
+                "id": 1100,
+                "topic_id": 300,
+                "post_number": 1,
+                "username": "charlie",
+                "cooked": "<p>Does anyone know how to configure this?</p>",
+            },
+            1101: {
+                "id": 1101,
+                "topic_id": 301,
+                "post_number": 1,
+                "username": "dana",
+                "cooked": "<p>Can someone explain the supported path?</p>",
+            },
         }
         self.upload_calls: list[dict[str, object]] = []
+        self.latest_topic_calls: list[dict[str, int | None]] = []
+        self.latest_topics_payload = {
+            "topic_list": {
+                "topics": [
+                    {
+                        "id": 300,
+                        "title": "Latest support question",
+                        "slug": "latest-support-question",
+                        "highest_post_number": 1,
+                        "last_poster_username": "charlie",
+                        "category_id": 20,
+                    }
+                ]
+            }
+        }
+        self.latest_topic_pages: dict[int | None, dict[str, object]] | None = None
 
     def set_notification_type_map(self, mapping: dict[int, str]) -> None:
         self.notification_type_map = mapping
@@ -116,6 +184,12 @@ class FakeDiscourseClient:
     def list_notifications(self, *, paginate: bool = True) -> list[Notification]:
         self.notification_paginate_calls.append(paginate)
         return list(self.notifications)
+
+    def list_latest_topics(self, *, per_page: int = 5, page: int | None = None) -> dict[str, object]:
+        self.latest_topic_calls.append({"per_page": per_page, "page": page})
+        if self.latest_topic_pages is not None:
+            return self.latest_topic_pages.get(page, {"topic_list": {"topics": []}})
+        return self.latest_topics_payload
 
     def get_topic(self, topic_id: int, *, post_number: int | None = None) -> dict[str, object]:
         return self.topics[topic_id]
@@ -147,8 +221,14 @@ class FakeDiscourseClient:
 
 
 class FakeOllamaClient:
-    def __init__(self, decisions: list[ModelDecision]) -> None:
+    def __init__(
+        self,
+        decisions: list[ModelDecision],
+        *,
+        autonomous_selections: list[AutonomousSelection] | None = None,
+    ) -> None:
         self.decisions = decisions
+        self.autonomous_selections = autonomous_selections or []
         self.calls: list[dict[str, object]] = []
 
     def decide(self, **kwargs: object) -> ModelDecision:
@@ -158,6 +238,14 @@ class FakeOllamaClient:
     def compose_manual_reply(self, **kwargs: object) -> ModelDecision:
         self.calls.append(kwargs)
         return self.decisions.pop(0)
+
+    def compose_autonomous_reply(self, **kwargs: object) -> ModelDecision:
+        self.calls.append(kwargs)
+        return self.decisions.pop(0)
+
+    def select_autonomous_reply_target(self, **kwargs: object) -> AutonomousSelection:
+        self.calls.append(kwargs)
+        return self.autonomous_selections.pop(0)
 
 
 class FailingPresenceAdapter(NullPresenceAdapter):
@@ -501,6 +589,222 @@ class ServiceTests(unittest.TestCase):
             service.run_once()
 
             self.assertEqual(discourse.created_posts[0]["reply_to_post_number"], 2)
+
+    def test_autonomous_reply_scan_queues_manual_command_for_selected_latest_post(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([])
+            selected_url = "https://forum.example.com/t/latest-support-question/300/1"
+            ollama = FakeOllamaClient(
+                [],
+                autonomous_selections=[
+                    AutonomousSelection("reply", selected_url, 0.91, "Clear unanswered setup question")
+                ],
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_interval_seconds=60,
+                    bot_autonomous_reply_latest_count=3,
+                    bot_autonomous_reply_min_confidence=0.75,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            commands = storage.list_manual_commands()
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0].status, "queued")
+            self.assertEqual(commands[0].post_url, selected_url)
+            self.assertIn("Clear unanswered setup question", commands[0].user_request)
+            self.assertTrue(commands[0].user_request.startswith("AUTONOMOUS_REPLY_SELECTION:"))
+            stats = storage.stats_summary()
+            self.assertEqual(stats["autonomous_queued"], 1)
+            self.assertEqual(discourse.created_posts, [])
+
+    def test_autonomous_reply_command_uses_autonomous_composer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            storage.enqueue_manual_command(
+                post_url="https://forum.example.com/t/topic-100/100/2",
+                user_request="AUTONOMOUS_REPLY_SELECTION: Good place to join the thread.",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+            discourse = FakeDiscourseClient([])
+            ollama = FakeOllamaClient([ModelDecision("reply", "That is not how this works.", "Autonomous reply")])
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(str(database_path)),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            self.assertEqual(discourse.created_posts[0]["raw"], "That is not how this works.")
+            self.assertIn("selection_reason", ollama.calls[0])
+            self.assertNotIn("user_request", ollama.calls[0])
+
+    def test_autonomous_reply_scan_skips_post_with_pending_notification_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([make_notification(12, 1, 100, 2)])
+            discourse.latest_topics_payload = {
+                "topic_list": {
+                    "topics": [
+                        {
+                            "id": 100,
+                            "title": "Topic 100",
+                            "slug": "topic-100",
+                            "highest_post_number": 2,
+                            "last_poster_username": "alice",
+                            "category_id": 20,
+                        }
+                    ]
+                }
+            }
+            ollama = FakeOllamaClient([ModelDecision("reply", "Already handling it.", "Notification reply")])
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_interval_seconds=60,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            self.assertEqual(len(discourse.created_posts), 1)
+            self.assertTrue(storage.has_bot_reply_target(topic_id=100, reply_to_post_number=2))
+            autonomous_calls = [call for call in ollama.calls if "candidates" in call]
+            self.assertEqual(autonomous_calls, [])
+
+    def test_autonomous_reply_scan_skips_candidates_when_model_declines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([])
+            ollama = FakeOllamaClient(
+                [],
+                autonomous_selections=[
+                    AutonomousSelection("skip", None, 0.2, "Nothing needs a proactive reply")
+                ],
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_interval_seconds=1,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+            clock.advance(2)
+            service.run_once()
+
+            self.assertEqual(storage.list_manual_commands(), [])
+            self.assertEqual(storage.stats_summary()["autonomous_skipped"], 1)
+            autonomous_calls = [
+                call for call in ollama.calls if "candidates" in call
+            ]
+            self.assertEqual(len(autonomous_calls), 1)
+
+    def test_autonomous_reply_scan_skips_blocked_categories_and_loads_more_latest_topics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([])
+            discourse.latest_topic_pages = {
+                None: {
+                    "topic_list": {
+                        "topics": [
+                            {
+                                "id": 300,
+                                "title": "Blocked child topic",
+                                "slug": "latest-support-question",
+                                "highest_post_number": 1,
+                                "last_poster_username": "charlie",
+                                "category_id": 11,
+                            }
+                        ]
+                    }
+                },
+                1: {
+                    "topic_list": {
+                        "topics": [
+                            {
+                                "id": 301,
+                                "title": "Allowed followup question",
+                                "slug": "allowed-followup-question",
+                                "highest_post_number": 1,
+                                "last_poster_username": "dana",
+                                "category_id": 20,
+                            }
+                        ]
+                    }
+                },
+            }
+            selected_url = "https://forum.example.com/t/allowed-followup-question/301/1"
+            ollama = FakeOllamaClient(
+                [],
+                autonomous_selections=[
+                    AutonomousSelection("reply", selected_url, 0.9, "Allowed category question")
+                ],
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_latest_count=1,
+                    bot_autonomous_reply_blocked_category_urls=(
+                        "https://forum.example.com/c/restricted/10",
+                    ),
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            commands = storage.list_manual_commands()
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0].post_url, selected_url)
+            autonomous_calls = [call for call in ollama.calls if "candidates" in call]
+            self.assertEqual(len(autonomous_calls[0]["candidates"]), 1)
+            self.assertEqual(autonomous_calls[0]["candidates"][0].topic_id, 301)
+            self.assertEqual(
+                [call["page"] for call in discourse.latest_topic_calls],
+                [None, 1],
+            )
 
     def test_inspect_notifications_uses_single_page_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

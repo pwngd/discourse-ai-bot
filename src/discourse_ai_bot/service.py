@@ -12,9 +12,14 @@ from urllib.parse import urlsplit
 from discourse_ai_bot.classifier import DEFAULT_NOTIFICATION_TYPES, NotificationClassifier
 from discourse_ai_bot.context import ContextResolver
 from discourse_ai_bot.gifs import GifCatalog, GifOption
-from discourse_ai_bot.models import BotIdentity, ClassifiedNotification, Notification
+from discourse_ai_bot.models import AutonomousCandidate, BotIdentity, ClassifiedNotification, Notification
 from discourse_ai_bot.settings import Settings
 from discourse_ai_bot.utils import datetime_to_storage, parse_datetime, utc_now
+
+
+AUTONOMOUS_LATEST_PAGE_SIZE = 30
+AUTONOMOUS_LATEST_MAX_PAGES = 5
+AUTONOMOUS_REPLY_REQUEST_PREFIX = "AUTONOMOUS_REPLY_SELECTION:"
 
 
 class BotService:
@@ -48,6 +53,9 @@ class BotService:
         )
         self.gif_catalog = GifCatalog(Path.cwd() / "gifs")
         self.activity_events: deque[dict[str, str]] = deque(maxlen=100)
+        self._last_autonomous_reply_scan_at: Any | None = None
+        self.category_parent_ids: dict[int, int | None] = {}
+        self.autonomous_blocked_category_ids: set[int] = set()
 
     def bootstrap(self) -> BotIdentity:
         if self.identity is not None and self.classifier is not None:
@@ -59,6 +67,13 @@ class BotService:
         if not type_map:
             type_map = DEFAULT_NOTIFICATION_TYPES
         self.discourse.set_notification_type_map(type_map)
+        self.category_parent_ids = _category_parent_map(site_info.get("categories", []))
+        self.autonomous_blocked_category_ids = _resolve_blocked_category_ids(
+            self.settings.bot_autonomous_reply_blocked_category_urls,
+            site_info.get("categories", []),
+            self.discourse,
+            logger=self.logger,
+        )
 
         if self.settings.discourse_auth_mode == "session_cookie":
             session_payload = self.discourse.get_current_session()
@@ -96,6 +111,7 @@ class BotService:
         self._record_activity(f"Polled {len(notifications)} notifications.")
         self._evaluate_notifications(notifications)
         self._evaluate_manual_commands()
+        self._evaluate_autonomous_reply_candidates()
         self._refresh_presence()
         self._refresh_manual_presence()
         self._process_due_jobs()
@@ -188,6 +204,11 @@ class BotService:
                 "autoread_post_time_seconds": self.settings.bot_autoread_post_time_seconds,
                 "typing_mode": self.settings.bot_typing_mode,
                 "model": self.settings.ollama_model,
+                "autonomous_reply_enabled": self.settings.bot_autonomous_reply_enabled,
+                "autonomous_reply_interval_seconds": self.settings.bot_autonomous_reply_interval_seconds,
+                "autonomous_reply_latest_count": self.settings.bot_autonomous_reply_latest_count,
+                "autonomous_reply_min_confidence": self.settings.bot_autonomous_reply_min_confidence,
+                "autonomous_reply_blocked_categories": len(self.autonomous_blocked_category_ids),
             },
             "storage": summary,
         }
@@ -369,6 +390,226 @@ class BotService:
         for command in self.storage.list_ready_manual_commands(datetime_to_storage(now)):
             self._prepare_manual_command(command, now)
 
+    def _evaluate_autonomous_reply_candidates(self) -> None:
+        if not self.settings.bot_autonomous_reply_enabled:
+            return
+        if self.identity is None:
+            return
+
+        now = self.now_fn()
+        if (
+            self._last_autonomous_reply_scan_at is not None
+            and (now - self._last_autonomous_reply_scan_at).total_seconds()
+            < self.settings.bot_autonomous_reply_interval_seconds
+        ):
+            return
+        self._last_autonomous_reply_scan_at = now
+
+        try:
+            candidates = self._collect_autonomous_candidates()
+        except Exception as exc:
+            self._record_activity(
+                f"Failed to collect autonomous reply candidates: {exc}",
+                level="warning",
+            )
+            self.logger.warning("Failed to collect autonomous reply candidates: %s", exc)
+            return
+
+        if not candidates:
+            self._record_activity("Autonomous reply scan found no new latest-post candidates.")
+            return
+
+        try:
+            selection = self.ollama.select_autonomous_reply_target(
+                model=self.settings.ollama_model,
+                system_prompt=self.settings.system_prompt,
+                identity=self.identity,
+                candidates=candidates,
+                min_confidence=self.settings.bot_autonomous_reply_min_confidence,
+                options=self.settings.ollama_options,
+                keep_alive=self.settings.ollama_keep_alive,
+            )
+        except Exception as exc:
+            self._record_activity(
+                f"Failed to select autonomous reply target: {exc}",
+                level="warning",
+            )
+            self.logger.warning("Failed to select autonomous reply target: %s", exc)
+            return
+
+        if selection.action == "skip":
+            for candidate in candidates:
+                self.storage.record_autonomous_target(
+                    post_url=candidate.post_url,
+                    topic_id=candidate.topic_id,
+                    post_number=candidate.post_number,
+                    status="skipped",
+                    reason=selection.reason,
+                    recorded_at=datetime_to_storage(now),
+                )
+            self._record_activity(
+                "Autonomous reply scan skipped "
+                f"{len(candidates)} candidates: {selection.reason}"
+            )
+            return
+
+        selected = next(
+            (candidate for candidate in candidates if candidate.post_url == selection.post_url),
+            None,
+        )
+        if selected is None:
+            self._record_activity(
+                f"Autonomous selection returned an unknown post URL: {selection.post_url}",
+                level="warning",
+            )
+            self.logger.warning(
+                "Autonomous selection returned an unknown post URL: %s",
+                selection.post_url,
+            )
+            return
+
+        if selection.confidence < self.settings.bot_autonomous_reply_min_confidence:
+            self.storage.record_autonomous_target(
+                post_url=selected.post_url,
+                topic_id=selected.topic_id,
+                post_number=selected.post_number,
+                status="skipped",
+                reason=(
+                    f"Confidence {selection.confidence:.2f} below "
+                    f"{self.settings.bot_autonomous_reply_min_confidence:.2f}: {selection.reason}"
+                ),
+                recorded_at=datetime_to_storage(now),
+            )
+            self._record_activity(
+                "Autonomous reply target skipped for low confidence "
+                f"({selection.confidence:.2f}): {selected.post_url}"
+            )
+            return
+
+        command_id = self.storage.enqueue_manual_command(
+            post_url=selected.post_url,
+            user_request=_autonomous_reply_request(selection.reason),
+            created_at=datetime_to_storage(now),
+        )
+        self.storage.record_autonomous_target(
+            post_url=selected.post_url,
+            topic_id=selected.topic_id,
+            post_number=selected.post_number,
+            status="queued",
+            reason=selection.reason,
+            recorded_at=datetime_to_storage(now),
+            command_id=command_id,
+        )
+        self._record_activity(
+            "Autonomous reply queued manual command "
+            f"{command_id} for {selected.post_url} (confidence {selection.confidence:.2f})."
+        )
+
+    def _collect_autonomous_candidates(self) -> list[AutonomousCandidate]:
+        candidates: list[AutonomousCandidate] = []
+        skipped_blocked = 0
+        for page in range(AUTONOMOUS_LATEST_MAX_PAGES):
+            payload = self.discourse.list_latest_topics(
+                per_page=AUTONOMOUS_LATEST_PAGE_SIZE,
+                page=page if page > 0 else None,
+            )
+            topic_list = payload.get("topic_list") if isinstance(payload, dict) else None
+            topics = topic_list.get("topics", []) if isinstance(topic_list, dict) else []
+            if not topics:
+                break
+
+            for topic in topics:
+                if not isinstance(topic, dict):
+                    continue
+                candidate = self._topic_to_autonomous_candidate(topic)
+                if candidate == "blocked":
+                    skipped_blocked += 1
+                    continue
+                if candidate is None:
+                    continue
+                candidates.append(candidate)
+                if len(candidates) >= self.settings.bot_autonomous_reply_latest_count:
+                    if skipped_blocked:
+                        self._record_activity(
+                            f"Autonomous reply scan skipped {skipped_blocked} latest topics in blocked categories."
+                        )
+                    return candidates
+        if skipped_blocked:
+            self._record_activity(
+                f"Autonomous reply scan skipped {skipped_blocked} latest topics in blocked categories."
+            )
+        return candidates
+
+    def _topic_to_autonomous_candidate(self, topic: dict[str, object]) -> AutonomousCandidate | str | None:
+        topic_id = _optional_int(topic.get("id"))
+        post_number = _latest_topic_post_number(topic)
+        if topic_id is None or post_number is None:
+            return None
+
+        category_id = _optional_int(topic.get("category_id"))
+        if _category_is_blocked(
+            category_id,
+            blocked_ids=self.autonomous_blocked_category_ids,
+            parent_ids=self.category_parent_ids,
+        ):
+            return "blocked"
+
+        actor_username = _optional_str(topic.get("last_poster_username"))
+        if self.identity and _same_username(actor_username, self.identity.username):
+            return None
+
+        slug = _optional_str(topic.get("slug")) or "topic"
+        post_url = _topic_post_url(
+            self.settings.discourse_host,
+            slug=slug,
+            topic_id=topic_id,
+            post_number=post_number,
+        )
+        if self.storage.has_manual_command_for_post_url(post_url):
+            return None
+        if self.storage.is_autonomous_target_seen(post_url):
+            return None
+        if self.storage.has_bot_reply_target(
+            topic_id=topic_id,
+            reply_to_post_number=post_number,
+        ):
+            return None
+
+        try:
+            context = self.context_resolver.resolve_topic(
+                notification_id=0,
+                trigger="autonomous_scan",
+                actor_username=actor_username,
+                topic_id=topic_id,
+                post_number=post_number,
+                slug=slug,
+            )
+        except Exception as exc:
+            self._record_activity(
+                f"Unable to resolve autonomous candidate {post_url}: {exc}",
+                level="warning",
+            )
+            self.logger.warning(
+                "Unable to resolve autonomous candidate %s: %s",
+                post_url,
+                exc,
+            )
+            return None
+
+        if self.identity and context.target_post and _same_username(
+            context.target_post.username,
+            self.identity.username,
+        ):
+            return None
+
+        return AutonomousCandidate(
+            post_url=post_url,
+            topic_id=topic_id,
+            post_number=post_number,
+            actor_username=actor_username,
+            context=context,
+        )
+
     def _prepare_manual_command(self, command: Any, now: Any) -> None:
         try:
             target = self.discourse.resolve_post_url(command.post_url)
@@ -380,16 +621,29 @@ class BotService:
                 post_number=target.get("post_number"),
                 post_id=target.get("post_id"),
             )
-            decision = self.ollama.compose_manual_reply(
-                model=self.settings.ollama_model,
-                system_prompt=self.settings.system_prompt,
-                identity=self.identity,
-                context=context,
-                user_request=command.user_request,
-                available_gifs=self.gif_catalog.list_options(),
-                options=self.settings.ollama_options,
-                keep_alive=self.settings.ollama_keep_alive,
-            )
+            selection_reason = _autonomous_reply_selection_reason(command.user_request)
+            if selection_reason is None:
+                decision = self.ollama.compose_manual_reply(
+                    model=self.settings.ollama_model,
+                    system_prompt=self.settings.system_prompt,
+                    identity=self.identity,
+                    context=context,
+                    user_request=command.user_request,
+                    available_gifs=self.gif_catalog.list_options(),
+                    options=self.settings.ollama_options,
+                    keep_alive=self.settings.ollama_keep_alive,
+                )
+            else:
+                decision = self.ollama.compose_autonomous_reply(
+                    model=self.settings.ollama_model,
+                    system_prompt=self.settings.system_prompt,
+                    identity=self.identity,
+                    context=context,
+                    selection_reason=selection_reason,
+                    available_gifs=self.gif_catalog.list_options(),
+                    options=self.settings.ollama_options,
+                    keep_alive=self.settings.ollama_keep_alive,
+                )
         except Exception as exc:
             attempts = command.attempts + 1
             next_available = now + timedelta(seconds=self._backoff_seconds(attempts))
@@ -675,3 +929,154 @@ def _reverse_notification_types(raw_mapping: object) -> dict[int, str]:
         except (TypeError, ValueError):
             continue
     return reversed_mapping
+
+
+def _latest_topic_post_number(topic: dict[str, object]) -> int | None:
+    for key in ("highest_post_number", "posts_count"):
+        value = _optional_int(topic.get(key))
+        if value is not None and value > 0:
+            return value
+    return None
+
+
+def _category_parent_map(categories_payload: object) -> dict[int, int | None]:
+    if not isinstance(categories_payload, list):
+        return {}
+    parent_ids: dict[int, int | None] = {}
+    for item in categories_payload:
+        if not isinstance(item, dict):
+            continue
+        category_id = _optional_int(item.get("id"))
+        if category_id is None:
+            continue
+        parent_ids[category_id] = _optional_int(item.get("parent_category_id"))
+    return parent_ids
+
+
+def _resolve_blocked_category_ids(
+    category_urls: tuple[str, ...],
+    categories_payload: object,
+    discourse: object,
+    *,
+    logger: logging.Logger,
+) -> set[int]:
+    if not category_urls:
+        return set()
+
+    categories = [item for item in categories_payload if isinstance(item, dict)] if isinstance(categories_payload, list) else []
+    by_slug = _category_ids_by_slug(categories)
+    blocked_ids: set[int] = set()
+    for category_url in category_urls:
+        category_id = _category_id_from_url(category_url)
+        if category_id is None:
+            category_id = _category_id_from_slug_url(category_url, by_slug)
+        if category_id is None:
+            try:
+                resolved = discourse.resolve_category_url(category_url)
+            except Exception as exc:
+                logger.warning(
+                    "Unable to resolve autonomous blocked category URL %s: %s",
+                    category_url,
+                    exc,
+                )
+                continue
+            category_id = _optional_int(resolved.get("category_id")) if isinstance(resolved, dict) else None
+        if category_id is None:
+            logger.warning("Unable to resolve autonomous blocked category URL %s.", category_url)
+            continue
+        blocked_ids.add(category_id)
+    return blocked_ids
+
+
+def _category_ids_by_slug(categories: list[dict[str, object]]) -> dict[str, list[int]]:
+    by_slug: dict[str, list[int]] = {}
+    for category in categories:
+        category_id = _optional_int(category.get("id"))
+        slug = _optional_str(category.get("slug"))
+        if category_id is None or slug is None:
+            continue
+        by_slug.setdefault(slug, []).append(category_id)
+    return by_slug
+
+
+def _category_id_from_url(category_url: str) -> int | None:
+    segments = _category_url_segments(category_url)
+    if not segments:
+        return None
+    numeric_segments = [_optional_int(segment) for segment in segments[1:]]
+    numeric_segments = [segment for segment in numeric_segments if segment is not None]
+    return numeric_segments[-1] if numeric_segments else None
+
+
+def _category_id_from_slug_url(category_url: str, by_slug: dict[str, list[int]]) -> int | None:
+    segments = _category_url_segments(category_url)
+    if not segments:
+        return None
+    slug_segments = [segment for segment in segments[1:] if _optional_int(segment) is None]
+    if not slug_segments:
+        return None
+    matches = by_slug.get(slug_segments[-1], [])
+    return matches[0] if len(matches) == 1 else None
+
+
+def _category_url_segments(category_url: str) -> list[str]:
+    path = urlsplit(category_url).path or category_url
+    segments = [segment for segment in path.split("/") if segment]
+    if not segments or segments[0] != "c":
+        return []
+    return segments
+
+
+def _category_is_blocked(
+    category_id: int | None,
+    *,
+    blocked_ids: set[int],
+    parent_ids: dict[int, int | None],
+) -> bool:
+    if category_id is None or not blocked_ids:
+        return False
+    seen: set[int] = set()
+    current: int | None = category_id
+    while current is not None and current not in seen:
+        if current in blocked_ids:
+            return True
+        seen.add(current)
+        current = parent_ids.get(current)
+    return False
+
+
+def _topic_post_url(host: str, *, slug: str, topic_id: int, post_number: int) -> str:
+    return f"{host.rstrip('/')}/t/{slug}/{topic_id}/{post_number}"
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_str(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _same_username(left: str | None, right: str | None) -> bool:
+    if left is None or right is None:
+        return False
+    return left.strip().casefold() == right.strip().casefold()
+
+
+def _autonomous_reply_request(reason: str) -> str:
+    return f"{AUTONOMOUS_REPLY_REQUEST_PREFIX} {reason.strip()}"
+
+
+def _autonomous_reply_selection_reason(user_request: str) -> str | None:
+    if not user_request.startswith(AUTONOMOUS_REPLY_REQUEST_PREFIX):
+        return None
+    reason = user_request[len(AUTONOMOUS_REPLY_REQUEST_PREFIX) :].strip()
+    return reason or "The latest-post scanner selected this post as worth joining."

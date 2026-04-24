@@ -5,3 +5,8 @@
 *.sqlite3
 .sqlite3
 *.gif
+
+# Python bytecode/cache artifacts
+__pycache__/
+*.py[cod]
+*$py.class

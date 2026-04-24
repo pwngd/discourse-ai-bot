@@ -120,6 +120,31 @@ class SettingsTests(unittest.TestCase):
         )
         self.assertEqual(settings.bot_autoread_post_time_seconds, 60.0)
 
+    def test_autonomous_reply_settings_are_parsed(self) -> None:
+        settings = load_settings(
+            {
+                "DISCOURSE_HOST": "https://forum.example.com",
+                "DISCOURSE_AUTH_MODE": "api_key",
+                "DISCOURSE_TOKEN": "token",
+                "DISCOURSE_USERNAME": "bot",
+                "BOT_OLLAMA_HOST": "http://localhost:11434",
+                "OLLAMA_MODEL": "qwen3",
+                "BOT_AUTONOMOUS_REPLY_ENABLED": "true",
+                "BOT_AUTONOMOUS_REPLY_INTERVAL": "2m",
+                "BOT_AUTONOMOUS_REPLY_LATEST_COUNT": "7",
+                "BOT_AUTONOMOUS_REPLY_MIN_CONFIDENCE": "0.8",
+                "BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS": "https://forum.example.com/c/staff/4, https://forum.example.com/c/private/5",
+            }
+        )
+        self.assertTrue(settings.bot_autonomous_reply_enabled)
+        self.assertEqual(settings.bot_autonomous_reply_interval_seconds, 120.0)
+        self.assertEqual(settings.bot_autonomous_reply_latest_count, 7)
+        self.assertEqual(settings.bot_autonomous_reply_min_confidence, 0.8)
+        self.assertEqual(
+            settings.bot_autonomous_reply_blocked_category_urls,
+            ("https://forum.example.com/c/staff/4", "https://forum.example.com/c/private/5"),
+        )
+
     def test_session_cookie_mode_is_inferred_from_cookie_string(self) -> None:
         settings = load_settings(
             {

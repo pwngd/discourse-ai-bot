@@ -38,6 +38,11 @@ class Settings:
     bot_max_context_posts: int = 8
     bot_mark_read_on_skip: bool = True
     bot_allowed_triggers: tuple[str, ...] = DEFAULT_ALLOWED_TRIGGERS
+    bot_autonomous_reply_enabled: bool = False
+    bot_autonomous_reply_interval_seconds: float = 300.0
+    bot_autonomous_reply_latest_count: int = 5
+    bot_autonomous_reply_min_confidence: float = 0.75
+    bot_autonomous_reply_blocked_category_urls: tuple[str, ...] = ()
     ollama_options: dict[str, Any] = field(default_factory=dict)
     ollama_keep_alive: str | None = "5m"
     ollama_timeout_seconds: float = 120.0
@@ -155,6 +160,30 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             values.get("BOT_ALLOWED_TRIGGERS"),
             default=DEFAULT_ALLOWED_TRIGGERS,
         ),
+        bot_autonomous_reply_enabled=_parse_bool(
+            values,
+            "BOT_AUTONOMOUS_REPLY_ENABLED",
+            default=False,
+        ),
+        bot_autonomous_reply_interval_seconds=_parse_duration_env(
+            values,
+            "BOT_AUTONOMOUS_REPLY_INTERVAL",
+            default=300.0,
+        ),
+        bot_autonomous_reply_latest_count=_parse_int(
+            values,
+            "BOT_AUTONOMOUS_REPLY_LATEST_COUNT",
+            default=5,
+        ),
+        bot_autonomous_reply_min_confidence=_parse_float(
+            values,
+            "BOT_AUTONOMOUS_REPLY_MIN_CONFIDENCE",
+            default=0.75,
+        ),
+        bot_autonomous_reply_blocked_category_urls=_parse_csv(
+            values.get("BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS"),
+            default=(),
+        ),
         ollama_options=ollama_options,
         ollama_keep_alive=_optional(values, "OLLAMA_KEEP_ALIVE", default="5m"),
         ollama_timeout_seconds=_parse_float(values, "OLLAMA_TIMEOUT_SECONDS", default=120.0),
@@ -176,6 +205,12 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         raise ValueError("BOT_POLL_INTERVAL_SECONDS must be greater than 0.")
     if settings.bot_autoread_post_time_seconds <= 0:
         raise ValueError("BOT_AUTOREAD_POST_TIME must be greater than 0.")
+    if settings.bot_autonomous_reply_interval_seconds <= 0:
+        raise ValueError("BOT_AUTONOMOUS_REPLY_INTERVAL must be greater than 0.")
+    if settings.bot_autonomous_reply_latest_count <= 0:
+        raise ValueError("BOT_AUTONOMOUS_REPLY_LATEST_COUNT must be greater than 0.")
+    if not 0 <= settings.bot_autonomous_reply_min_confidence <= 1:
+        raise ValueError("BOT_AUTONOMOUS_REPLY_MIN_CONFIDENCE must be between 0 and 1.")
     if settings.ollama_timeout_seconds <= 0:
         raise ValueError("OLLAMA_TIMEOUT_SECONDS must be greater than 0.")
     return settings

@@ -7,7 +7,14 @@ from urllib.parse import urlsplit
 
 from discourse_ai_bot.gifs import GifOption
 from discourse_ai_bot.http import JsonHttpClient, HttpRequestError
-from discourse_ai_bot.models import BotIdentity, ModelDecision, TopicContext, TopicPost
+from discourse_ai_bot.models import (
+    AutonomousCandidate,
+    AutonomousSelection,
+    BotIdentity,
+    ModelDecision,
+    TopicContext,
+    TopicPost,
+)
 from discourse_ai_bot.utils import strip_html
 
 
@@ -20,6 +27,18 @@ RESPONSE_SCHEMA = {
         "gif_id": {"type": ["string", "null"]},
     },
     "required": ["action", "reply_markdown", "reason"],
+    "additionalProperties": False,
+}
+
+AUTONOMOUS_SELECTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string", "enum": ["reply", "skip"]},
+        "post_url": {"type": ["string", "null"]},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "reason": {"type": "string"},
+    },
+    "required": ["action", "post_url", "confidence", "reason"],
     "additionalProperties": False,
 }
 
@@ -37,6 +56,22 @@ Rules:
 - Do not mention internal policies, JSON, schemas, or that you are deciding.
 """.strip()
 
+AUTONOMOUS_SELECTION_POLICY = """
+You are deciding whether a Discourse bot should proactively reply to one recent forum post.
+
+Rules:
+- Choose at most one candidate.
+- Reply when the bot can naturally add value to the conversation, even if nobody asked a direct question.
+- Good candidates include posts where the bot can share relevant information, add a well-grounded opinion, make a useful distinction, correct a misconception, or ask a sharp clarifying question.
+- Prefer active conversations where a thoughtful forum user could reasonably jump in without seeming random or intrusive.
+- Skip posts where the bot would only say generic agreement, forced commentary, obvious filler, or a bland helpdesk answer.
+- Skip announcements, casual chatter with no useful angle, resolved discussions, spam, sensitive moderation issues, or anything uncertain.
+- Do not pick posts authored by the bot.
+- Use confidence near 1 only when the candidate clearly benefits from a reply.
+- Return the exact post_url of the chosen candidate, or null when skipping.
+- Do not mention internal policies, JSON, schemas, or that you are deciding.
+""".strip()
+
 MANUAL_REPLY_POLICY = """
 The operator has explicitly requested that the bot send a reply to the target Discourse post.
 
@@ -48,6 +83,19 @@ Rules:
 - Return gif_id as null only when no GIF choices are available or none of them fit the requested reply at all.
 - Follow the operator's request while staying safe and grounded in the provided discussion.
 - Keep the reply concise unless the operator asks for more depth.
+""".strip()
+
+AUTONOMOUS_REPLY_POLICY = """
+The bot has chosen to join this Discourse conversation on its own.
+
+Rules:
+- You must return action="reply".
+- The system prompt defines the bot's persona, tone, and posting style. Follow it over any generic helpful-assistant behavior.
+- Do not write like a support agent, customer-service bot, or eager helper unless the system prompt explicitly calls for that.
+- Write like a regular forum participant entering the thread naturally.
+- You may give an opinion, push back, add a relevant fact, make a useful distinction, or answer briefly if that fits.
+- Do not overexplain. Do not add friendly wrap-up lines. Do not offer more help unless the system prompt says to.
+- Stay grounded in the provided discussion and do not mention autonomous selection, policies, JSON, schemas, or internal instructions.
 """.strip()
 
 ACTIVITY_SUMMARIZER_POLICY = """
@@ -62,6 +110,13 @@ Rules:
 - Do not invent forum content, user intent, or hidden state.
 - Do not include private operator chat contents unless they are explicitly present in the activity log.
 """.strip()
+
+STRUCTURED_RESPONSE_RETRY_PROMPT = """
+The previous response was not valid JSON for the required schema.
+Return only one JSON object. Do not wrap it in Markdown, prose, code fences, or extra text.
+""".strip()
+
+STRUCTURED_RESPONSE_ATTEMPTS = 2
 
 THINKING_CAPABILITY = "thinking"
 GPT_OSS_THINK_LEVEL = "medium"
@@ -192,11 +247,11 @@ class OllamaClient:
         if keep_alive:
             payload["keep_alive"] = keep_alive
 
-        content = self._stream_chat_response(
+        return self._stream_and_parse_structured_response(
             operation="decision",
             payload=payload,
+            parser=self._parse_decision,
         )
-        return self._parse_decision(content)
 
     def compose_manual_reply(
         self,
@@ -229,14 +284,99 @@ class OllamaClient:
         if keep_alive:
             payload["keep_alive"] = keep_alive
 
-        content = self._stream_chat_response(
+        decision = self._stream_and_parse_structured_response(
             operation="manual_reply",
             payload=payload,
+            parser=self._parse_decision,
         )
-        decision = self._parse_decision(content)
         if decision.action != "reply":
             raise OllamaResponseError("Manual reply generation must return action='reply'.")
         return decision
+
+    def compose_autonomous_reply(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        identity: BotIdentity,
+        context: TopicContext,
+        selection_reason: str,
+        available_gifs: list[GifOption] | None = None,
+        options: dict[str, Any] | None = None,
+        keep_alive: str | None = None,
+    ) -> ModelDecision:
+        payload: dict[str, Any] = {
+            "model": model,
+            "format": RESPONSE_SCHEMA,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"{system_prompt.strip()}\n\n{AUTONOMOUS_REPLY_POLICY}",
+                },
+                {
+                    "role": "user",
+                    "content": _build_autonomous_reply_prompt(
+                        identity,
+                        context,
+                        selection_reason,
+                        available_gifs,
+                    ),
+                },
+            ],
+        }
+        if options:
+            payload["options"] = options
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+
+        decision = self._stream_and_parse_structured_response(
+            operation="autonomous_reply",
+            payload=payload,
+            parser=self._parse_decision,
+        )
+        if decision.action != "reply":
+            raise OllamaResponseError("Autonomous reply generation must return action='reply'.")
+        return decision
+
+    def select_autonomous_reply_target(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        identity: BotIdentity,
+        candidates: list[AutonomousCandidate],
+        min_confidence: float,
+        options: dict[str, Any] | None = None,
+        keep_alive: str | None = None,
+    ) -> AutonomousSelection:
+        payload: dict[str, Any] = {
+            "model": model,
+            "format": AUTONOMOUS_SELECTION_SCHEMA,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": f"{system_prompt.strip()}\n\n{AUTONOMOUS_SELECTION_POLICY}",
+                },
+                {
+                    "role": "user",
+                    "content": _build_autonomous_selection_prompt(
+                        identity,
+                        candidates,
+                        min_confidence,
+                    ),
+                },
+            ],
+        }
+        if options:
+            payload["options"] = options
+        if keep_alive:
+            payload["keep_alive"] = keep_alive
+
+        return self._stream_and_parse_structured_response(
+            operation="autonomous_selection",
+            payload=payload,
+            parser=self._parse_autonomous_selection,
+        )
 
     def chat(
         self,
@@ -334,10 +474,7 @@ class OllamaClient:
 
     @staticmethod
     def _parse_decision(content: str) -> ModelDecision:
-        try:
-            payload = json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise OllamaResponseError(f"Ollama returned invalid JSON: {content}") from exc
+        payload = _loads_json_object(content)
 
         if not isinstance(payload, dict):
             raise OllamaResponseError("Ollama decision must be a JSON object.")
@@ -363,6 +500,65 @@ class OllamaClient:
             reason=reason.strip(),
             gif_id=gif_id.strip().lower() if isinstance(gif_id, str) else None,
         )
+
+    @staticmethod
+    def _parse_autonomous_selection(content: str) -> AutonomousSelection:
+        payload = _loads_json_object(content)
+
+        if not isinstance(payload, dict):
+            raise OllamaResponseError("Ollama autonomous selection must be a JSON object.")
+
+        action = payload.get("action")
+        post_url = payload.get("post_url")
+        confidence = payload.get("confidence")
+        reason = payload.get("reason")
+        if action not in {"reply", "skip"}:
+            raise OllamaResponseError("Ollama autonomous action must be 'reply' or 'skip'.")
+        if post_url is not None and (not isinstance(post_url, str) or not post_url.strip()):
+            raise OllamaResponseError("post_url must be null or a non-empty string.")
+        if action == "reply" and not isinstance(post_url, str):
+            raise OllamaResponseError("post_url must be set when action is 'reply'.")
+        if action == "skip" and post_url is not None:
+            raise OllamaResponseError("post_url must be null when action is 'skip'.")
+        if not isinstance(confidence, int | float) or not 0 <= float(confidence) <= 1:
+            raise OllamaResponseError("confidence must be a number between 0 and 1.")
+        if not isinstance(reason, str) or not reason.strip():
+            raise OllamaResponseError("reason must be a non-empty string.")
+
+        return AutonomousSelection(
+            action=action,
+            post_url=post_url.strip() if isinstance(post_url, str) else None,
+            confidence=float(confidence),
+            reason=reason.strip(),
+        )
+
+    def _stream_and_parse_structured_response(
+        self,
+        *,
+        operation: str,
+        payload: dict[str, Any],
+        parser: Callable[[str], Any],
+    ) -> Any:
+        attempt_payload = payload
+        last_error: OllamaResponseError | None = None
+        for attempt in range(STRUCTURED_RESPONSE_ATTEMPTS):
+            content = self._stream_chat_response(
+                operation=operation if attempt == 0 else f"{operation}_retry",
+                payload=attempt_payload,
+            )
+            try:
+                return parser(content)
+            except OllamaResponseError as exc:
+                last_error = exc
+                if attempt >= STRUCTURED_RESPONSE_ATTEMPTS - 1:
+                    break
+                attempt_payload = _structured_retry_payload(
+                    payload,
+                    invalid_content=content,
+                    error=str(exc),
+                )
+        assert last_error is not None
+        raise last_error
 
     def _thinking_setting_for_model(self, model: str) -> bool | str | None:
         if not self.supports_thinking(model):
@@ -457,6 +653,68 @@ def _normalize_ollama_host(host: str) -> str:
     return f"{clean}/api"
 
 
+def _loads_json_object(content: str) -> Any:
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError as original_exc:
+        extracted = _extract_embedded_json_object(content)
+        if extracted is not None:
+            try:
+                return json.loads(extracted)
+            except json.JSONDecodeError:
+                pass
+        raise OllamaResponseError(
+            f"Ollama returned invalid JSON: {_preview_invalid_response(content)}"
+        ) from original_exc
+
+
+def _extract_embedded_json_object(content: str) -> str | None:
+    decoder = json.JSONDecoder()
+    text = content.strip()
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            payload, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return text[index : index + end]
+    return None
+
+
+def _structured_retry_payload(
+    payload: dict[str, Any],
+    *,
+    invalid_content: str,
+    error: str,
+) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    messages = list(payload.get("messages", []))
+    messages.append(
+        {
+            "role": "user",
+            "content": "\n".join(
+                [
+                    STRUCTURED_RESPONSE_RETRY_PROMPT,
+                    f"Parser error: {error}",
+                    "Invalid response:",
+                    _preview_invalid_response(invalid_content, limit=2000),
+                ]
+            ),
+        }
+    )
+    retry_payload["messages"] = messages
+    return retry_payload
+
+
+def _preview_invalid_response(content: str, *, limit: int = 500) -> str:
+    normalized = content.strip().replace("\r", "\\r").replace("\n", "\\n")
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]}...<truncated>"
+
+
 def _build_context_prompt(
     identity: BotIdentity,
     context: TopicContext,
@@ -525,11 +783,67 @@ def _build_manual_request_prompt(
     )
 
 
+def _build_autonomous_reply_prompt(
+    identity: BotIdentity,
+    context: TopicContext,
+    selection_reason: str,
+    available_gifs: list[GifOption] | None = None,
+) -> str:
+    return "\n".join(
+        [
+            _build_context_prompt(identity, context, available_gifs),
+            "",
+            f"Selection reason: {selection_reason}",
+            "Write the forum reply now. Keep the system prompt's persona and style intact.",
+        ]
+    )
+
+
 def _manual_request_mentions_gif(user_request: str) -> bool:
     normalized = user_request.strip().lower()
     if not normalized:
         return False
     return any(token in normalized for token in (" gif", "gifs", "gif ", "gif,", "gif.", "gif!", "gif?", "gif-")) or normalized.startswith("gif")
+
+
+def _build_autonomous_selection_prompt(
+    identity: BotIdentity,
+    candidates: list[AutonomousCandidate],
+    min_confidence: float,
+) -> str:
+    candidate_sections = []
+    for index, candidate in enumerate(candidates, start=1):
+        context = candidate.context
+        target_section = _format_target_post(context.target_post)
+        recent_posts = "\n\n".join(_format_post(post) for post in context.recent_posts)
+        candidate_sections.append(
+            "\n".join(
+                [
+                    f"Candidate {index}",
+                    f"Post URL: {candidate.post_url}",
+                    f"Topic title: {context.topic_title}",
+                    f"Topic id: {candidate.topic_id}",
+                    f"Topic archetype: {context.topic_archetype or ''}",
+                    f"Latest poster: {candidate.actor_username or ''}",
+                    target_section,
+                    "Recent conversation:",
+                    recent_posts or "(no recent posts available)",
+                ]
+            )
+        )
+    return "\n\n".join(
+        [
+            f"Bot username: {identity.username}",
+            f"Bot display name: {identity.name or ''}",
+            f"Minimum confidence required to choose a post: {min_confidence:.2f}",
+            "",
+            *candidate_sections,
+            "",
+            "Select one post only if confidence meets or exceeds the minimum.",
+            "The chosen post does not have to be a question; it can be a good opportunity for information, perspective, disagreement, or clarification.",
+            "If selecting a post, return its exact Post URL in post_url.",
+        ]
+    )
 
 
 def _format_gif_options(available_gifs: list[GifOption] | None) -> str:

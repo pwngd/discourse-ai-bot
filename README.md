@@ -9,6 +9,7 @@ Use `BOT_OLLAMA_HOST` to point the bot at Ollama. The project intentionally does
 - Supports Discourse admin API auth (`Api-Key`, `Api-Username`) and session-cookie auth
 - Supports optional custom headers like `Cookie` and `User-Agent` on all Discourse API requests
 - Polls notifications and reacts to mentions, replies, and private messages
+- Can optionally scan latest topics and let Ollama choose one post for a proactive reply
 - Lets Ollama choose whether to reply or skip
 - Lets Ollama optionally include one approved GIF from `./gifs` when it replies
 - Schedules randomized reply delays and persists jobs in SQLite
@@ -77,6 +78,20 @@ python -m discourse_ai_bot queue-ai-reply --post-url "https://forum.example.com/
 ```
 
 The worker will pick up the queued command on its next polling cycle, fetch the target post context, send your request plus the discussion to Ollama, apply the normal randomized delay, simulate typing if enabled, and then post the reply back to that Discourse post.
+
+## Autonomous Latest-Post Replies
+
+Set `BOT_AUTONOMOUS_REPLY_ENABLED=true` to let the worker occasionally inspect the latest Discourse topics. The scanner asks Ollama to choose at most one recent post that is worth a proactive reply. If Ollama picks a target above the configured confidence threshold, the bot queues a normal manual AI reply command for that post, so the existing delay, presence, retry, GIF, and posting flow is reused.
+
+```env
+BOT_AUTONOMOUS_REPLY_ENABLED=true
+BOT_AUTONOMOUS_REPLY_INTERVAL=5m
+BOT_AUTONOMOUS_REPLY_LATEST_COUNT=5
+BOT_AUTONOMOUS_REPLY_MIN_CONFIDENCE=0.75
+BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS=
+```
+
+Posts the scanner already queued or skipped are remembered in SQLite so the same latest post is not reconsidered every polling cycle. Leave `BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS` empty to allow all categories. To block categories, set it to a comma-separated list of category URLs, for example `https://forum.example.com/c/staff/4,https://forum.example.com/c/private/5`. Topics in child categories are skipped when their parent category is blocked, and the scanner will keep paging through latest topics until it fills the candidate set or runs out of pages.
 
 ## Optional GIF Replies
 

@@ -82,6 +82,30 @@ class BotStorage:
 
                 CREATE INDEX IF NOT EXISTS idx_manual_commands_status_due_at
                 ON manual_commands(status, due_at);
+
+                CREATE TABLE IF NOT EXISTS autonomous_reply_targets (
+                    post_url TEXT PRIMARY KEY,
+                    topic_id INTEGER NOT NULL,
+                    post_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL,
+                    command_id INTEGER
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_autonomous_reply_targets_recorded_at
+                ON autonomous_reply_targets(recorded_at);
+
+                CREATE TABLE IF NOT EXISTS bot_reply_targets (
+                    topic_id INTEGER NOT NULL,
+                    reply_to_post_number INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    source_id INTEGER,
+                    recorded_at TEXT NOT NULL,
+                    response_post_id INTEGER,
+                    PRIMARY KEY (topic_id, reply_to_post_number)
+                );
                 """
             )
             _ensure_column(connection, "pending_replies", "gif_id", "TEXT")
@@ -166,6 +190,16 @@ class BotStorage:
                 ),
             )
             rowcount = cursor.rowcount
+            if rowcount > 0 and reply_to_post_number is not None:
+                _upsert_reply_target(
+                    connection,
+                    topic_id=topic_id,
+                    reply_to_post_number=reply_to_post_number,
+                    status="pending",
+                    source="notification",
+                    source_id=notification_id,
+                    recorded_at=created_at,
+                )
         return rowcount > 0
 
     def update_job_presence(self, notification_id: int, last_presence_at: str) -> None:
@@ -207,6 +241,14 @@ class BotStorage:
         response_post_id: int | None = None,
     ) -> None:
         with self._session() as connection:
+            pending_row = connection.execute(
+                """
+                SELECT topic_id, reply_to_post_number, created_at
+                FROM pending_replies
+                WHERE notification_id = ?
+                """,
+                (notification_id,),
+            ).fetchone()
             connection.execute(
                 """
                 INSERT OR REPLACE INTO handled_notifications (
@@ -219,6 +261,17 @@ class BotStorage:
                 """,
                 (notification_id, action, reason, response_post_id, handled_at),
             )
+            if action == "reply" and pending_row and pending_row["reply_to_post_number"] is not None:
+                _upsert_reply_target(
+                    connection,
+                    topic_id=int(pending_row["topic_id"]),
+                    reply_to_post_number=int(pending_row["reply_to_post_number"]),
+                    status="replied",
+                    source="notification",
+                    source_id=notification_id,
+                    recorded_at=handled_at,
+                    response_post_id=response_post_id,
+                )
             connection.execute(
                 "DELETE FROM pending_replies WHERE notification_id = ?",
                 (notification_id,),
@@ -257,6 +310,88 @@ class BotStorage:
             )
             command_id = int(cursor.lastrowid)
         return command_id
+
+    def has_manual_command_for_post_url(self, post_url: str) -> bool:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM manual_commands WHERE post_url = ? LIMIT 1",
+                (post_url,),
+            ).fetchone()
+        return row is not None
+
+    def has_bot_reply_target(self, *, topic_id: int, reply_to_post_number: int) -> bool:
+        with self._session() as connection:
+            row = connection.execute(
+                """
+                SELECT 1 FROM bot_reply_targets
+                WHERE topic_id = ? AND reply_to_post_number = ?
+                LIMIT 1
+                """,
+                (topic_id, reply_to_post_number),
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM pending_replies
+                    WHERE topic_id = ? AND reply_to_post_number = ?
+                    LIMIT 1
+                    """,
+                    (topic_id, reply_to_post_number),
+                ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    """
+                    SELECT 1 FROM manual_commands
+                    WHERE topic_id = ? AND reply_to_post_number = ?
+                      AND status IN ('scheduled', 'completed')
+                    LIMIT 1
+                    """,
+                    (topic_id, reply_to_post_number),
+                ).fetchone()
+        return row is not None
+
+    def is_autonomous_target_seen(self, post_url: str) -> bool:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM autonomous_reply_targets WHERE post_url = ?",
+                (post_url,),
+            ).fetchone()
+        return row is not None
+
+    def record_autonomous_target(
+        self,
+        *,
+        post_url: str,
+        topic_id: int,
+        post_number: int,
+        status: str,
+        reason: str,
+        recorded_at: str,
+        command_id: int | None = None,
+    ) -> None:
+        with self._session() as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO autonomous_reply_targets (
+                    post_url,
+                    topic_id,
+                    post_number,
+                    status,
+                    reason,
+                    recorded_at,
+                    command_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    post_url,
+                    topic_id,
+                    post_number,
+                    status,
+                    reason,
+                    recorded_at,
+                    command_id,
+                ),
+            )
 
     def list_ready_manual_commands(self, available_at: str) -> list[ManualCommand]:
         with self._session() as connection:
@@ -333,6 +468,16 @@ class BotStorage:
                     command_id,
                 ),
             )
+            if reply_to_post_number is not None:
+                _upsert_reply_target(
+                    connection,
+                    topic_id=topic_id,
+                    reply_to_post_number=reply_to_post_number,
+                    status="pending",
+                    source="manual_command",
+                    source_id=command_id,
+                    recorded_at=due_at,
+                )
 
     def reschedule_manual_command_generation(
         self,
@@ -389,6 +534,14 @@ class BotStorage:
         completed_at: str,
     ) -> None:
         with self._session() as connection:
+            command_row = connection.execute(
+                """
+                SELECT topic_id, reply_to_post_number
+                FROM manual_commands
+                WHERE command_id = ?
+                """,
+                (command_id,),
+            ).fetchone()
             connection.execute(
                 """
                 UPDATE manual_commands
@@ -402,6 +555,17 @@ class BotStorage:
                 """,
                 (response_post_id, completed_at, command_id),
             )
+            if command_row and command_row["topic_id"] is not None and command_row["reply_to_post_number"] is not None:
+                _upsert_reply_target(
+                    connection,
+                    topic_id=int(command_row["topic_id"]),
+                    reply_to_post_number=int(command_row["reply_to_post_number"]),
+                    status="replied",
+                    source="manual_command",
+                    source_id=command_id,
+                    recorded_at=completed_at,
+                    response_post_id=response_post_id,
+                )
 
     def list_manual_commands(self) -> list[ManualCommand]:
         with self._session() as connection:
@@ -424,9 +588,13 @@ class BotStorage:
                 WHERE status IN ('queued', 'scheduled')
                 """
             ).rowcount
+            pending_reply_targets_deleted = connection.execute(
+                "DELETE FROM bot_reply_targets WHERE status = 'pending'"
+            ).rowcount
         return {
             "pending_replies_deleted": int(pending_replies_deleted),
             "manual_commands_deleted": int(manual_commands_deleted),
+            "pending_reply_targets_deleted": int(pending_reply_targets_deleted),
         }
 
     def reset_database(self) -> dict[str, int]:
@@ -440,10 +608,18 @@ class BotStorage:
             manual_commands_deleted = connection.execute(
                 "DELETE FROM manual_commands"
             ).rowcount
+            autonomous_targets_deleted = connection.execute(
+                "DELETE FROM autonomous_reply_targets"
+            ).rowcount
+            reply_targets_deleted = connection.execute(
+                "DELETE FROM bot_reply_targets"
+            ).rowcount
         return {
             "handled_notifications_deleted": int(handled_notifications_deleted),
             "pending_replies_deleted": int(pending_replies_deleted),
             "manual_commands_deleted": int(manual_commands_deleted),
+            "autonomous_targets_deleted": int(autonomous_targets_deleted),
+            "reply_targets_deleted": int(reply_targets_deleted),
         }
 
     def stats_summary(self) -> dict[str, int]:
@@ -488,6 +664,22 @@ class BotStorage:
                 connection,
                 "SELECT COUNT(*) FROM manual_commands WHERE last_error IS NOT NULL",
             )
+            autonomous_targets = _scalar_int(
+                connection,
+                "SELECT COUNT(*) FROM autonomous_reply_targets",
+            )
+            autonomous_queued = _scalar_int(
+                connection,
+                "SELECT COUNT(*) FROM autonomous_reply_targets WHERE status = 'queued'",
+            )
+            autonomous_skipped = _scalar_int(
+                connection,
+                "SELECT COUNT(*) FROM autonomous_reply_targets WHERE status = 'skipped'",
+            )
+            reply_targets = _scalar_int(
+                connection,
+                "SELECT COUNT(*) FROM bot_reply_targets",
+            )
         return {
             "handled_total": handled_total,
             "handled_replied": handled_replied,
@@ -499,6 +691,10 @@ class BotStorage:
             "manual_scheduled": manual_scheduled,
             "manual_completed": manual_completed,
             "manual_errors": manual_errors,
+            "autonomous_targets": autonomous_targets,
+            "autonomous_queued": autonomous_queued,
+            "autonomous_skipped": autonomous_skipped,
+            "reply_targets": reply_targets,
         }
 
 
@@ -547,6 +743,47 @@ def _scalar_int(connection: sqlite3.Connection, query: str) -> int:
     if row is None:
         return 0
     return int(row[0])
+
+
+def _upsert_reply_target(
+    connection: sqlite3.Connection,
+    *,
+    topic_id: int,
+    reply_to_post_number: int,
+    status: str,
+    source: str,
+    source_id: int | None,
+    recorded_at: str,
+    response_post_id: int | None = None,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO bot_reply_targets (
+            topic_id,
+            reply_to_post_number,
+            status,
+            source,
+            source_id,
+            recorded_at,
+            response_post_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(topic_id, reply_to_post_number) DO UPDATE SET
+            status = excluded.status,
+            source = excluded.source,
+            source_id = excluded.source_id,
+            recorded_at = excluded.recorded_at,
+            response_post_id = excluded.response_post_id
+        """,
+        (
+            topic_id,
+            reply_to_post_number,
+            status,
+            source,
+            source_id,
+            recorded_at,
+            response_post_id,
+        ),
+    )
 
 
 def _ensure_column(connection: sqlite3.Connection, table_name: str, column_name: str, definition: str) -> None:
