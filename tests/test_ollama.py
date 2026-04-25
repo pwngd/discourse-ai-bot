@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import unittest
 
+from discourse_ai_bot.http import HttpRequestError
 from discourse_ai_bot.models import AutonomousCandidate, BotIdentity, TopicContext, TopicPost
 from discourse_ai_bot.ollama import (
     OllamaClient,
     OllamaResponseError,
     ThinkingEvent,
+    _build_autonomous_selection_prompt,
+    _build_context_messages,
     _build_manual_request_prompt,
 )
 
@@ -30,6 +33,8 @@ class FakeTransport:
         else:
             items = response
         for item in items:
+            if isinstance(item, Exception):
+                raise item
             yield item
 
 
@@ -183,7 +188,51 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual(decision.reply_markdown, "Recovered.")
         self.assertEqual(len(transport.stream_calls), 2)
         retry_messages = transport.stream_calls[1][2]["json_body"]["messages"]
-        self.assertIn("previous response was not valid JSON", retry_messages[-1]["content"])
+        self.assertIn("Force a reply to the target post now", retry_messages[-1]["content"])
+
+    def test_decision_timeout_retries_with_forced_non_thinking_reply(self) -> None:
+        ticks = iter([0.0, 1.2, 0.0, 0.1, 0.2])
+        client = OllamaClient(
+            "http://localhost:11434",
+            timeout_seconds=1,
+            monotonic_fn=lambda: next(ticks),
+        )
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            [
+                {"message": {"thinking": "Still deciding. "}, "done": False},
+            ],
+            [
+                {
+                    "message": {
+                        "content": '{"action":"reply","reply_markdown":"Forced reply.","reason":"Decision retry forced a reply"}'
+                    }
+                },
+                {"done": True},
+            ],
+        ]
+        client.http = transport
+
+        decision = client.decide(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=self.context,
+        )
+
+        self.assertEqual(decision.action, "reply")
+        self.assertEqual(decision.reply_markdown, "Forced reply.")
+        self.assertEqual(len(transport.stream_calls), 2)
+        retry_payload = transport.stream_calls[1][2]["json_body"]
+        self.assertIs(retry_payload["think"], False)
+        self.assertIn("Force a reply to the target post now", retry_payload["messages"][-1]["content"])
 
     def test_compose_manual_reply_requires_reply_action(self) -> None:
         client = OllamaClient("http://localhost:11434")
@@ -211,6 +260,150 @@ class OllamaTests(unittest.TestCase):
 
         self.assertEqual(decision.action, "reply")
         self.assertEqual(decision.reply_markdown, "On it.")
+
+    def test_compose_manual_reply_includes_optional_roblox_docs_context(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": '{"action":"reply","reply_markdown":"Use Enum.PartType.Block.","reason":"Docs checked"}'}},
+            {"done": True},
+        ]
+        client.http = transport
+
+        client.compose_manual_reply(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=self.context,
+            user_request="Answer the Roblox API question.",
+            roblox_docs_context="Verified Roblox API docs context:\n- enum: PartType",
+        )
+
+        messages = transport.stream_calls[0][2]["json_body"]["messages"]
+        self.assertTrue(
+            any("Verified Roblox API docs context" in message["content"] for message in messages)
+        )
+        docs_index = next(
+            index
+            for index, message in enumerate(messages)
+            if "Verified Roblox API docs context" in message["content"]
+        )
+        self.assertIn("Operator request", messages[docs_index + 1]["content"])
+
+    def test_context_messages_treat_bot_posts_as_assistant_chat_turns(self) -> None:
+        context = TopicContext(
+            notification_id=11,
+            trigger="replied",
+            actor_username="alice",
+            topic_id=99,
+            topic_title="Followup",
+            topic_slug="followup",
+            topic_archetype=None,
+            target_post=TopicPost(
+                post_id=558,
+                topic_id=99,
+                post_number=4,
+                username="alice",
+                cooked="<p>What did you mean?</p>",
+                raw=None,
+            ),
+            recent_posts=(
+                TopicPost(
+                    post_id=555,
+                    topic_id=99,
+                    post_number=1,
+                    username="alice",
+                    cooked="<p>Initial question</p>",
+                    raw=None,
+                ),
+                TopicPost(
+                    post_id=556,
+                    topic_id=99,
+                    post_number=2,
+                    username="bot",
+                    cooked="<p>Earlier answer</p>",
+                    raw=None,
+                ),
+                TopicPost(
+                    post_id=557,
+                    topic_id=99,
+                    post_number=3,
+                    username="alice",
+                    cooked="<p>Followup</p>",
+                    raw=None,
+                ),
+            ),
+        )
+
+        messages = _build_context_messages(self.identity, context, available_gifs=[])
+
+        self.assertEqual([message["role"] for message in messages[1:4]], ["user", "assistant", "user"])
+        self.assertIn("your earlier forum post", messages[2]["content"])
+        self.assertIn("avoid acting unaware", messages[0]["content"])
+
+    def test_decide_sends_forum_posts_as_separate_chat_messages(self) -> None:
+        context = TopicContext(
+            notification_id=12,
+            trigger="mentioned",
+            actor_username="alice",
+            topic_id=99,
+            topic_title="Question",
+            topic_slug="question",
+            topic_archetype=None,
+            target_post=self.context.target_post,
+            recent_posts=(
+                TopicPost(
+                    post_id=555,
+                    topic_id=99,
+                    post_number=1,
+                    username="alice",
+                    cooked="<p>Hello there</p>",
+                    raw=None,
+                ),
+                TopicPost(
+                    post_id=556,
+                    topic_id=99,
+                    post_number=2,
+                    username="bot",
+                    cooked="<p>I already answered this bit.</p>",
+                    raw=None,
+                ),
+            ),
+        )
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": '{"action":"skip","reply_markdown":"","reason":"Already answered"}'}},
+            {"done": True},
+        ]
+        client.http = transport
+
+        client.decide(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=context,
+        )
+
+        messages = transport.stream_calls[0][2]["json_body"]["messages"]
+        self.assertGreaterEqual(len(messages), 6)
+        self.assertEqual(messages[2]["role"], "user")
+        self.assertEqual(messages[3]["role"], "assistant")
+        self.assertIn("I already answered this bit", messages[3]["content"])
 
     def test_compose_autonomous_reply_uses_persona_first_policy(self) -> None:
         client = OllamaClient("http://localhost:11434")
@@ -293,6 +486,213 @@ class OllamaTests(unittest.TestCase):
         messages = kwargs["json_body"]["messages"]
         self.assertIn("grounded opinion", messages[0]["content"])
         self.assertIn("does not have to be a question", messages[1]["content"])
+
+    def test_autonomous_selection_prompt_is_compact_for_large_candidate_sets(self) -> None:
+        long_text = " ".join(f"word{i}" for i in range(300))
+        context = TopicContext(
+            notification_id=0,
+            trigger="autonomous_scan",
+            actor_username="alice",
+            topic_id=99,
+            topic_title="Large topic",
+            topic_slug="large-topic",
+            topic_archetype=None,
+            target_post=TopicPost(
+                post_id=600,
+                topic_id=99,
+                post_number=10,
+                username="alice",
+                cooked="",
+                raw=long_text,
+            ),
+            recent_posts=tuple(
+                TopicPost(
+                    post_id=600 + index,
+                    topic_id=99,
+                    post_number=index,
+                    username="alice",
+                    cooked="",
+                    raw=f"recent post {index} " + long_text,
+                )
+                for index in range(1, 8)
+            ),
+        )
+
+        prompt = _build_autonomous_selection_prompt(
+            self.identity,
+            [
+                AutonomousCandidate(
+                    post_url="https://forum.example.com/t/large-topic/99/10",
+                    topic_id=99,
+                    post_number=10,
+                    actor_username="alice",
+                    context=context,
+                )
+            ],
+            min_confidence=0.75,
+        )
+
+        self.assertIn("Target post text:", prompt)
+        self.assertIn("<truncated>", prompt)
+        self.assertNotIn("Post #1 by alice", prompt)
+        self.assertIn("Post #5 by alice", prompt)
+        self.assertIn("Post #7 by alice", prompt)
+
+    def test_autonomous_selection_timeout_gets_one_chance(self) -> None:
+        ticks = iter([0.0, 1.2])
+        client = OllamaClient(
+            "http://localhost:11434",
+            timeout_seconds=1,
+            monotonic_fn=lambda: next(ticks),
+        )
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"thinking": "Still weighing candidates. "}, "done": False},
+        ]
+        client.http = transport
+
+        with self.assertRaisesRegex(OllamaResponseError, "exceeded 1s"):
+            client.select_autonomous_reply_target(
+                model="qwen3",
+                system_prompt="Prompt",
+                identity=self.identity,
+                candidates=[
+                    AutonomousCandidate(
+                        post_url="https://forum.example.com/t/question/99/2",
+                        topic_id=99,
+                        post_number=2,
+                        actor_username="alice",
+                        context=self.context,
+                    )
+                ],
+                min_confidence=0.75,
+            )
+
+        self.assertEqual(len(transport.stream_calls), 1)
+        first_payload = transport.stream_calls[0][2]["json_body"]
+        self.assertTrue(first_payload["think"])
+
+    def test_autonomous_selection_stream_failure_gets_one_chance(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            HttpRequestError("Timed out while streaming from Ollama")
+        ]
+        client.http = transport
+
+        with self.assertRaisesRegex(OllamaResponseError, "stream failed"):
+            client.select_autonomous_reply_target(
+                model="qwen3",
+                system_prompt="Prompt",
+                identity=self.identity,
+                candidates=[
+                    AutonomousCandidate(
+                        post_url="https://forum.example.com/t/question/99/2",
+                        topic_id=99,
+                        post_number=2,
+                        actor_username="alice",
+                        context=self.context,
+                    )
+                ],
+                min_confidence=0.75,
+            )
+
+        self.assertEqual(len(transport.stream_calls), 1)
+
+    def test_autonomous_selection_invalid_json_gets_one_chance(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": '{"action":"reply","post_url":"missing end"'}},
+            {"done": True},
+        ]
+        client.http = transport
+
+        with self.assertRaisesRegex(OllamaResponseError, "invalid JSON"):
+            client.select_autonomous_reply_target(
+                model="qwen3",
+                system_prompt="Prompt",
+                identity=self.identity,
+                candidates=[
+                    AutonomousCandidate(
+                        post_url="https://forum.example.com/t/question/99/2",
+                        topic_id=99,
+                        post_number=2,
+                        actor_username="alice",
+                        context=self.context,
+                    )
+                ],
+                min_confidence=0.75,
+            )
+
+        self.assertEqual(len(transport.stream_calls), 1)
+
+    def test_autonomous_reply_thinking_without_content_retries_and_posts(self) -> None:
+        ticks = iter([0.0, 0.1, 0.6, 0.0, 0.1, 0.2])
+        client = OllamaClient(
+            "http://localhost:11434",
+            timeout_seconds=10,
+            thinking_response_timeout_seconds=0.5,
+            monotonic_fn=lambda: next(ticks),
+        )
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            [
+                {"message": {"thinking": "Choosing words. "}, "done": False},
+                {"message": {"thinking": "Still no answer. "}, "done": False},
+            ],
+            [
+                {
+                    "message": {
+                        "content": '{"action":"reply","reply_markdown":"Post it now.","reason":"Strict retry wrote the reply"}'
+                    }
+                },
+                {"done": True},
+            ],
+        ]
+        client.http = transport
+
+        decision = client.compose_autonomous_reply(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=self.context,
+            selection_reason="Good target.",
+        )
+
+        self.assertEqual(decision.action, "reply")
+        self.assertEqual(decision.reply_markdown, "Post it now.")
+        retry_payload = transport.stream_calls[1][2]["json_body"]
+        self.assertIs(retry_payload["think"], False)
+        self.assertIn("Write the forum reply now", retry_payload["messages"][-1]["content"])
 
     def test_manual_request_prompt_marks_gif_as_required_when_requested(self) -> None:
         prompt = _build_manual_request_prompt(
@@ -404,6 +804,47 @@ class OllamaTests(unittest.TestCase):
                 ("start", ""),
                 ("chunk", "Inspect context. "),
                 ("chunk", "Draft response. "),
+                ("end", ""),
+            ],
+        )
+
+    def test_streaming_thinking_has_wall_clock_timeout(self) -> None:
+        ticks = iter([0.0, 0.2, 1.2])
+        client = OllamaClient(
+            "http://localhost:11434",
+            timeout_seconds=1,
+            monotonic_fn=lambda: next(ticks),
+        )
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion", "thinking"],
+                    "details": {"family": "qwen3", "families": ["qwen3"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"thinking": "Choose a post. "}, "done": False},
+            {"message": {"thinking": "Still thinking. "}, "done": False},
+            {"message": {"content": '{"action":"skip","reply_markdown":"","reason":"Done"}'}},
+            {"done": True},
+        ]
+        client.http = transport
+        events: list[ThinkingEvent] = []
+        client.set_thinking_callback(events.append)
+
+        with self.assertRaisesRegex(OllamaResponseError, "exceeded 1s"):
+            client.chat_stream(
+                model="qwen3",
+                system_prompt="Prompt",
+                messages=[{"role": "user", "content": "Hello"}],
+            )
+
+        self.assertEqual(
+            [(event.kind, event.chunk) for event in events],
+            [
+                ("start", ""),
+                ("chunk", "Choose a post. "),
                 ("end", ""),
             ],
         )

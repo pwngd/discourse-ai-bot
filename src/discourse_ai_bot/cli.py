@@ -245,6 +245,10 @@ def _collect_health(
         "ollama_model": model_info["model"],
         "reasoning_capable": model_info.get("reasoning_capable"),
         "typing_mode": settings.bot_typing_mode,
+        "roblox_docs_enabled": settings.bot_roblox_docs_enabled,
+        "roblox_docs_source": settings.bot_roblox_docs_source,
+        "roblox_docs_local_path": settings.bot_roblox_docs_local_path,
+        "roblox_docs_ref": settings.bot_roblox_docs_ref,
     }
     return result
 
@@ -696,15 +700,16 @@ def _handle_clear_command(
         return False
 
     target = tokens[1].lower()
+    if target == "queue":
+        result = service.clear_queue()
+        ui.print_success(
+            "Cleared outbound queue "
+            f"(manual_commands={result['manual_commands_deleted']}, "
+            f"pending_replies={result['pending_replies_deleted']})"
+        )
+        return False
+
     with service_lock:
-        if target == "queue":
-            result = service.clear_queue()
-            ui.print_success(
-                "Cleared outbound queue "
-                f"(manual_commands={result['manual_commands_deleted']}, "
-                f"pending_replies={result['pending_replies_deleted']})"
-            )
-            return False
         if target == "db":
             result = service.reset_database()
             state.private_chat_messages.clear()

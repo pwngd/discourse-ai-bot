@@ -409,6 +409,46 @@ class CliTests(unittest.TestCase):
 
         self.assertFalse(should_exit)
 
+    def test_handle_clear_command_does_not_wait_for_polling_lock(self) -> None:
+        class FakeService:
+            def __init__(self) -> None:
+                self.called = False
+
+            def clear_queue(self) -> dict[str, int]:
+                self.called = True
+                return {
+                    "manual_commands_deleted": 3,
+                    "pending_replies_deleted": 2,
+                }
+
+        lock = threading.Lock()
+        lock.acquire()
+        done = threading.Event()
+        service = FakeService()
+        result: dict[str, bool] = {}
+
+        def run_command() -> None:
+            try:
+                result["should_exit"] = _handle_clear_command(
+                    tokens=["/clear", "queue"],
+                    service=service,  # type: ignore[arg-type]
+                    service_lock=lock,
+                    state=_InteractiveState(),
+                )
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run_command, daemon=True)
+        thread.start()
+        try:
+            self.assertTrue(done.wait(0.5), "/clear queue waited for the polling worker lock")
+        finally:
+            lock.release()
+            thread.join(timeout=1.0)
+
+        self.assertFalse(result["should_exit"])
+        self.assertTrue(service.called)
+
     def test_handle_clear_command_resets_db_and_private_chat_messages(self) -> None:
         class FakeService:
             def reset_database(self) -> dict[str, int]:

@@ -92,6 +92,8 @@ class JsonHttpClient:
             raise HttpError(status_code=exc.code, url=url, body=body) from exc
         except URLError as exc:
             raise HttpRequestError(f"Unable to reach {url}: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise HttpRequestError(f"Timed out while reading from {url}") from exc
 
         if not raw_body.strip():
             return {}
@@ -150,6 +152,8 @@ class JsonHttpClient:
             raise HttpError(status_code=exc.code, url=url, body=body) from exc
         except URLError as exc:
             raise HttpRequestError(f"Unable to reach {url}: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise HttpRequestError(f"Timed out while streaming from {url}") from exc
 
 
 def _normalize_base_url(base_url: str) -> str:

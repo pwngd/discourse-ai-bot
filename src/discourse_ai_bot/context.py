@@ -90,7 +90,7 @@ class ContextResolver:
         if target_post is None and posts:
             target_post = posts[-1]
 
-        recent_posts = self._select_recent_posts(posts, stream_post_ids)
+        recent_posts = self._select_recent_posts(posts, stream_post_ids, target_post)
         if target_post and all(post.post_number != target_post.post_number for post in recent_posts):
             if len(recent_posts) >= self.max_posts:
                 recent_posts = recent_posts[1:]
@@ -191,7 +191,14 @@ class ContextResolver:
     ) -> list[int]:
         if self.max_posts <= 0:
             return []
-        required = list(stream_post_ids[-self.max_posts :]) if stream_post_ids else []
+        if not stream_post_ids:
+            return [target_post.post_id] if target_post and target_post.post_id is not None else []
+
+        if target_post and target_post.post_id in stream_post_ids:
+            target_index = stream_post_ids.index(target_post.post_id)
+            return self._window_around_index(stream_post_ids, target_index)
+
+        required = list(stream_post_ids[-self.max_posts :])
         if target_post and target_post.post_id is not None and target_post.post_id not in required:
             required.append(target_post.post_id)
         return required
@@ -200,22 +207,45 @@ class ContextResolver:
         self,
         posts: list[TopicPost],
         stream_post_ids: list[int],
+        target_post: TopicPost | None,
     ) -> list[TopicPost]:
         if self.max_posts <= 0:
             return []
-        if not stream_post_ids:
-            return take_last(posts, self.max_posts)
 
-        posts_by_id = {post.post_id: post for post in posts if post.post_id is not None}
-        recent_posts = [
-            posts_by_id[post_id]
-            for post_id in stream_post_ids[-self.max_posts :]
-            if post_id in posts_by_id
-        ]
-        if recent_posts:
-            recent_posts.sort(key=lambda item: item.post_number)
-            return recent_posts
+        if stream_post_ids:
+            post_ids = self._required_post_ids(stream_post_ids, target_post)
+            posts_by_id = {post.post_id: post for post in posts if post.post_id is not None}
+            window_posts = [
+                posts_by_id[post_id]
+                for post_id in post_ids
+                if post_id in posts_by_id
+            ]
+            if window_posts:
+                window_posts.sort(key=lambda item: item.post_number)
+                return window_posts
+
+        if target_post is not None:
+            for index, post in enumerate(posts):
+                if post.post_number == target_post.post_number:
+                    return self._window_around_index(posts, index)
         return take_last(posts, self.max_posts)
+
+    def _window_around_index(self, values: list, target_index: int) -> list:
+        if self.max_posts <= 0:
+            return []
+        if len(values) <= self.max_posts:
+            return list(values)
+
+        before_count = self.max_posts // 2
+        after_count = self.max_posts - before_count - 1
+        start = max(0, target_index - before_count)
+        end = min(len(values), target_index + after_count + 1)
+        if end - start < self.max_posts:
+            if start == 0:
+                end = min(len(values), self.max_posts)
+            else:
+                start = max(0, end - self.max_posts)
+        return list(values[start:end])
 
     @staticmethod
     def _find_post_by_number(posts: list[TopicPost], post_number: int) -> TopicPost | None:

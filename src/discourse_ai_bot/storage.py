@@ -311,6 +311,14 @@ class BotStorage:
             command_id = int(cursor.lastrowid)
         return command_id
 
+    def get_manual_command(self, command_id: int) -> ManualCommand | None:
+        with self._session() as connection:
+            row = connection.execute(
+                "SELECT * FROM manual_commands WHERE command_id = ?",
+                (command_id,),
+            ).fetchone()
+        return _row_to_manual_command(row) if row else None
+
     def has_manual_command_for_post_url(self, post_url: str) -> bool:
         with self._session() as connection:
             row = connection.execute(

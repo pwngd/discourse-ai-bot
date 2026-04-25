@@ -12,9 +12,18 @@ from urllib.parse import urlsplit
 from discourse_ai_bot.classifier import DEFAULT_NOTIFICATION_TYPES, NotificationClassifier
 from discourse_ai_bot.context import ContextResolver
 from discourse_ai_bot.gifs import GifCatalog, GifOption
-from discourse_ai_bot.models import AutonomousCandidate, BotIdentity, ClassifiedNotification, Notification
+from discourse_ai_bot.models import (
+    AutonomousCandidate,
+    AutonomousSelection,
+    BotIdentity,
+    ClassifiedNotification,
+    Notification,
+    TopicContext,
+    TopicPost,
+)
+from discourse_ai_bot.roblox_docs import RobloxDocsClient, RobloxDocsError
 from discourse_ai_bot.settings import Settings
-from discourse_ai_bot.utils import datetime_to_storage, parse_datetime, utc_now
+from discourse_ai_bot.utils import datetime_to_storage, parse_datetime, strip_html, utc_now
 
 
 AUTONOMOUS_LATEST_PAGE_SIZE = 30
@@ -35,6 +44,7 @@ class BotService:
         randomizer: random.Random | None = None,
         now_fn: Callable[[], Any] | None = None,
         sleep_fn: Callable[[float], None] = time.sleep,
+        roblox_docs_client: object | None = None,
     ) -> None:
         self.settings = settings
         self.discourse = discourse_client
@@ -52,6 +62,11 @@ class BotService:
             max_posts=settings.bot_max_context_posts,
         )
         self.gif_catalog = GifCatalog(Path.cwd() / "gifs")
+        self.roblox_docs = (
+            roblox_docs_client
+            if roblox_docs_client is not None
+            else _build_roblox_docs_client(settings)
+        )
         self.activity_events: deque[dict[str, str]] = deque(maxlen=100)
         self._last_autonomous_reply_scan_at: Any | None = None
         self.category_parent_ids: dict[int, int | None] = {}
@@ -209,6 +224,10 @@ class BotService:
                 "autonomous_reply_latest_count": self.settings.bot_autonomous_reply_latest_count,
                 "autonomous_reply_min_confidence": self.settings.bot_autonomous_reply_min_confidence,
                 "autonomous_reply_blocked_categories": len(self.autonomous_blocked_category_ids),
+                "roblox_docs_enabled": self.settings.bot_roblox_docs_enabled,
+                "roblox_docs_source": self.settings.bot_roblox_docs_source,
+                "roblox_docs_local_path": self.settings.bot_roblox_docs_local_path,
+                "roblox_docs_ref": self.settings.bot_roblox_docs_ref,
             },
             "storage": summary,
         }
@@ -241,12 +260,14 @@ class BotService:
         now = self.now_fn()
         try:
             context = self.context_resolver.resolve(classified)
+            roblox_docs_context = self._roblox_docs_context(context)
             decision = self.ollama.decide(
                 model=self.settings.ollama_model,
                 system_prompt=self.settings.system_prompt,
                 identity=self.identity,
                 context=context,
                 available_gifs=self.gif_catalog.list_options(),
+                roblox_docs_context=roblox_docs_context,
                 options=self.settings.ollama_options,
                 keep_alive=self.settings.ollama_keep_alive,
             )
@@ -255,7 +276,7 @@ class BotService:
                 f"Failed to evaluate notification {classified.notification.notification_id}: {exc}",
                 level="warning",
             )
-            self.logger.exception(
+            self.logger.warning(
                 "Failed to evaluate notification %s: %s",
                 classified.notification.notification_id,
                 exc,
@@ -403,8 +424,6 @@ class BotService:
             < self.settings.bot_autonomous_reply_interval_seconds
         ):
             return
-        self._last_autonomous_reply_scan_at = now
-
         try:
             candidates = self._collect_autonomous_candidates()
         except Exception as exc:
@@ -416,25 +435,12 @@ class BotService:
             return
 
         if not candidates:
+            self._last_autonomous_reply_scan_at = now
             self._record_activity("Autonomous reply scan found no new latest-post candidates.")
             return
 
-        try:
-            selection = self.ollama.select_autonomous_reply_target(
-                model=self.settings.ollama_model,
-                system_prompt=self.settings.system_prompt,
-                identity=self.identity,
-                candidates=candidates,
-                min_confidence=self.settings.bot_autonomous_reply_min_confidence,
-                options=self.settings.ollama_options,
-                keep_alive=self.settings.ollama_keep_alive,
-            )
-        except Exception as exc:
-            self._record_activity(
-                f"Failed to select autonomous reply target: {exc}",
-                level="warning",
-            )
-            self.logger.warning("Failed to select autonomous reply target: %s", exc)
+        selection = self._select_autonomous_reply_target_or_force(candidates)
+        if selection is None:
             return
 
         if selection.action == "skip":
@@ -447,6 +453,7 @@ class BotService:
                     reason=selection.reason,
                     recorded_at=datetime_to_storage(now),
                 )
+            self._last_autonomous_reply_scan_at = now
             self._record_activity(
                 "Autonomous reply scan skipped "
                 f"{len(candidates)} candidates: {selection.reason}"
@@ -480,6 +487,7 @@ class BotService:
                 ),
                 recorded_at=datetime_to_storage(now),
             )
+            self._last_autonomous_reply_scan_at = now
             self._record_activity(
                 "Autonomous reply target skipped for low confidence "
                 f"({selection.confidence:.2f}): {selected.post_url}"
@@ -504,6 +512,49 @@ class BotService:
             "Autonomous reply queued manual command "
             f"{command_id} for {selected.post_url} (confidence {selection.confidence:.2f})."
         )
+        self._last_autonomous_reply_scan_at = now
+        command = self.storage.get_manual_command(command_id)
+        if command is not None:
+            self._prepare_manual_command(command, now)
+
+    def _select_autonomous_reply_target_or_force(
+        self,
+        candidates: list[AutonomousCandidate],
+    ) -> AutonomousSelection | None:
+        try:
+            return self.ollama.select_autonomous_reply_target(
+                model=self.settings.ollama_model,
+                system_prompt=self.settings.system_prompt,
+                identity=self.identity,
+                candidates=candidates,
+                min_confidence=self.settings.bot_autonomous_reply_min_confidence,
+                options=self.settings.ollama_options,
+                keep_alive=self.settings.ollama_keep_alive,
+            )
+        except Exception as exc:
+            selected = candidates[0] if candidates else None
+            if selected is None:
+                self._record_activity(
+                    f"Failed to select autonomous reply target and no fallback candidate is available: {exc}",
+                    level="warning",
+                )
+                self.logger.warning(
+                    "Failed to select autonomous reply target and no fallback candidate is available: %s",
+                    exc,
+                )
+                return None
+            reason = (
+                "Ollama failed to select a target after one chance, "
+                f"so the bot is forcing a reply to the first eligible latest post: {exc}"
+            )
+            self._record_activity(reason, level="warning")
+            self.logger.warning("%s", reason)
+            return AutonomousSelection(
+                action="reply",
+                post_url=selected.post_url,
+                confidence=1.0,
+                reason=reason,
+            )
 
     def _collect_autonomous_candidates(self) -> list[AutonomousCandidate]:
         candidates: list[AutonomousCandidate] = []
@@ -621,6 +672,10 @@ class BotService:
                 post_number=target.get("post_number"),
                 post_id=target.get("post_id"),
             )
+            roblox_docs_context = self._roblox_docs_context(
+                context,
+                extra_text=command.user_request,
+            )
             selection_reason = _autonomous_reply_selection_reason(command.user_request)
             if selection_reason is None:
                 decision = self.ollama.compose_manual_reply(
@@ -630,6 +685,7 @@ class BotService:
                     context=context,
                     user_request=command.user_request,
                     available_gifs=self.gif_catalog.list_options(),
+                    roblox_docs_context=roblox_docs_context,
                     options=self.settings.ollama_options,
                     keep_alive=self.settings.ollama_keep_alive,
                 )
@@ -641,6 +697,7 @@ class BotService:
                     context=context,
                     selection_reason=selection_reason,
                     available_gifs=self.gif_catalog.list_options(),
+                    roblox_docs_context=roblox_docs_context,
                     options=self.settings.ollama_options,
                     keep_alive=self.settings.ollama_keep_alive,
                 )
@@ -864,6 +921,48 @@ class BotService:
             return base
         return f"{base}\n\n![{option.alt_text}]({upload_url})".strip()
 
+    def _roblox_docs_context(
+        self,
+        context: TopicContext,
+        *,
+        extra_text: str = "",
+    ) -> str | None:
+        if self.roblox_docs is None:
+            return None
+        context_for_text = getattr(self.roblox_docs, "context_for_text", None)
+        if not callable(context_for_text):
+            return None
+
+        query_text = _roblox_docs_query_text(context, extra_text=extra_text)
+        try:
+            docs_context = context_for_text(query_text)
+        except RobloxDocsError as exc:
+            self._record_activity(
+                f"Roblox docs lookup failed: {exc}",
+                level="warning",
+            )
+            self.logger.warning("Roblox docs lookup failed: %s", exc)
+            return None
+        except Exception as exc:
+            self._record_activity(
+                f"Roblox docs lookup failed unexpectedly: {exc}",
+                level="warning",
+            )
+            self.logger.warning("Roblox docs lookup failed unexpectedly: %s", exc)
+            return None
+        if docs_context is None:
+            return None
+
+        format_for_prompt = getattr(docs_context, "format_for_prompt", None)
+        if not callable(format_for_prompt):
+            return None
+        prompt_context = format_for_prompt(
+            max_chars=self.settings.bot_roblox_docs_max_context_chars,
+        )
+        if prompt_context:
+            self._record_activity("Attached Roblox API docs context to a coding question.")
+        return prompt_context or None
+
     def _upload_gif(self, option: GifOption) -> str | None:
         try:
             response = self.discourse.upload_file(option.path, upload_type="composer", synchronous=True)
@@ -917,6 +1016,40 @@ class BotService:
                 "message": message,
             }
         )
+
+
+def _build_roblox_docs_client(settings: Settings) -> RobloxDocsClient | None:
+    if not settings.bot_roblox_docs_enabled:
+        return None
+    return RobloxDocsClient(
+        ref=settings.bot_roblox_docs_ref,
+        timeout_seconds=settings.bot_roblox_docs_timeout_seconds,
+        cache_ttl_seconds=settings.bot_roblox_docs_cache_ttl_seconds,
+        max_terms=settings.bot_roblox_docs_max_terms,
+        max_results=settings.bot_roblox_docs_max_results,
+        max_context_chars=settings.bot_roblox_docs_max_context_chars,
+        source=settings.bot_roblox_docs_source,
+        local_path=settings.bot_roblox_docs_local_path,
+    )
+
+
+def _roblox_docs_query_text(context: TopicContext, *, extra_text: str = "") -> str:
+    parts = [
+        f"Topic title: {context.topic_title}",
+        f"Trigger: {context.trigger}",
+        extra_text,
+    ]
+    if context.target_post is not None:
+        parts.append(_topic_post_text(context.target_post))
+    for post in context.recent_posts:
+        if context.target_post is not None and post.post_number == context.target_post.post_number:
+            continue
+        parts.append(_topic_post_text(post))
+    return "\n\n".join(part for part in parts if part.strip())
+
+
+def _topic_post_text(post: TopicPost) -> str:
+    return post.raw or strip_html(post.cooked) or ""
 
 
 def _reverse_notification_types(raw_mapping: object) -> dict[int, str]:

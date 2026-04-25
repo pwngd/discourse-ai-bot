@@ -12,6 +12,7 @@ Use `BOT_OLLAMA_HOST` to point the bot at Ollama. The project intentionally does
 - Can optionally scan latest topics and let Ollama choose one post for a proactive reply
 - Lets Ollama choose whether to reply or skip
 - Lets Ollama optionally include one approved GIF from `./gifs` when it replies
+- Can optionally attach official Roblox Engine API docs context for Roblox/Luau coding questions
 - Schedules randomized reply delays and persists jobs in SQLite
 - Keeps working across restarts
 - Offers a best-effort optional presence adapter for `/presence/update`
@@ -92,6 +93,26 @@ BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS=
 ```
 
 Posts the scanner already queued or skipped are remembered in SQLite so the same latest post is not reconsidered every polling cycle. Leave `BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS` empty to allow all categories. To block categories, set it to a comma-separated list of category URLs, for example `https://forum.example.com/c/staff/4,https://forum.example.com/c/private/5`. Topics in child categories are skipped when their parent category is blocked, and the scanner will keep paging through latest topics until it fills the candidate set or runs out of pages.
+
+## Optional Roblox API Docs Verification
+
+Set `BOT_ROBLOX_DOCS_ENABLED=true` to let the bot fetch compact snippets from the official Roblox Creator Docs Engine API reference when a notification or manual request looks like a Roblox/Luau coding question. The lookup is gated by coding/API heuristics, so general Roblox discussion does not trigger docs requests.
+
+- `BOT_ROBLOX_DOCS_SOURCE` chooses `auto`, `local`, or `remote`, default `auto`
+- `BOT_ROBLOX_DOCS_LOCAL_PATH` points to a local sparse checkout, default `vendor/creator-docs`
+- `BOT_ROBLOX_DOCS_REF` chooses the `Roblox/creator-docs` Git ref, default `main`
+- `BOT_ROBLOX_DOCS_TIMEOUT_SECONDS` controls per-request timeout
+- `BOT_ROBLOX_DOCS_CACHE_TTL` controls the in-memory docs cache lifetime, default `24h`
+- `BOT_ROBLOX_DOCS_MAX_TERMS`, `BOT_ROBLOX_DOCS_MAX_RESULTS`, and `BOT_ROBLOX_DOCS_MAX_CONTEXT_CHARS` bound lookup and prompt size
+
+For the fastest path, keep a local sparse checkout:
+
+```powershell
+git clone --depth 1 --filter=blob:none --sparse https://github.com/Roblox/creator-docs vendor/creator-docs
+git -C vendor/creator-docs sparse-checkout set content/en-us/reference/engine
+```
+
+The `vendor/creator-docs/` directory is ignored by this repository. If the folder is missing in `auto` or `local` mode, the bot falls back to GitHub.
 
 ## Optional GIF Replies
 

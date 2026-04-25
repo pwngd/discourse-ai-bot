@@ -35,7 +35,7 @@ class Settings:
     bot_response_delay_min_seconds: float = 10.0
     bot_response_delay_max_seconds: float = 45.0
     bot_autoread_post_time_seconds: float = 120.0
-    bot_max_context_posts: int = 8
+    bot_max_context_posts: int = 20
     bot_mark_read_on_skip: bool = True
     bot_allowed_triggers: tuple[str, ...] = DEFAULT_ALLOWED_TRIGGERS
     bot_autonomous_reply_enabled: bool = False
@@ -43,6 +43,15 @@ class Settings:
     bot_autonomous_reply_latest_count: int = 5
     bot_autonomous_reply_min_confidence: float = 0.75
     bot_autonomous_reply_blocked_category_urls: tuple[str, ...] = ()
+    bot_roblox_docs_enabled: bool = False
+    bot_roblox_docs_source: str = "auto"
+    bot_roblox_docs_local_path: str | None = "vendor/creator-docs"
+    bot_roblox_docs_ref: str = "main"
+    bot_roblox_docs_timeout_seconds: float = 8.0
+    bot_roblox_docs_cache_ttl_seconds: float = 86400.0
+    bot_roblox_docs_max_terms: int = 6
+    bot_roblox_docs_max_results: int = 4
+    bot_roblox_docs_max_context_chars: int = 6000
     ollama_options: dict[str, Any] = field(default_factory=dict)
     ollama_keep_alive: str | None = "5m"
     ollama_timeout_seconds: float = 120.0
@@ -154,7 +163,7 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             "BOT_AUTOREAD_POST_TIME",
             default=120.0,
         ),
-        bot_max_context_posts=_parse_int(values, "BOT_MAX_CONTEXT_POSTS", default=8),
+        bot_max_context_posts=_parse_int(values, "BOT_MAX_CONTEXT_POSTS", default=20),
         bot_mark_read_on_skip=_parse_bool(values, "BOT_MARK_READ_ON_SKIP", default=True),
         bot_allowed_triggers=_parse_csv(
             values.get("BOT_ALLOWED_TRIGGERS"),
@@ -184,6 +193,43 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             values.get("BOT_AUTONOMOUS_REPLY_BLOCKED_CATEGORY_URLS"),
             default=(),
         ),
+        bot_roblox_docs_enabled=_parse_bool(
+            values,
+            "BOT_ROBLOX_DOCS_ENABLED",
+            default=False,
+        ),
+        bot_roblox_docs_source=values.get("BOT_ROBLOX_DOCS_SOURCE", "auto").strip() or "auto",
+        bot_roblox_docs_local_path=_optional(
+            values,
+            "BOT_ROBLOX_DOCS_LOCAL_PATH",
+            default="vendor/creator-docs",
+        ),
+        bot_roblox_docs_ref=values.get("BOT_ROBLOX_DOCS_REF", "main").strip() or "main",
+        bot_roblox_docs_timeout_seconds=_parse_float(
+            values,
+            "BOT_ROBLOX_DOCS_TIMEOUT_SECONDS",
+            default=8.0,
+        ),
+        bot_roblox_docs_cache_ttl_seconds=_parse_duration_env(
+            values,
+            "BOT_ROBLOX_DOCS_CACHE_TTL",
+            default=86400.0,
+        ),
+        bot_roblox_docs_max_terms=_parse_int(
+            values,
+            "BOT_ROBLOX_DOCS_MAX_TERMS",
+            default=6,
+        ),
+        bot_roblox_docs_max_results=_parse_int(
+            values,
+            "BOT_ROBLOX_DOCS_MAX_RESULTS",
+            default=4,
+        ),
+        bot_roblox_docs_max_context_chars=_parse_int(
+            values,
+            "BOT_ROBLOX_DOCS_MAX_CONTEXT_CHARS",
+            default=6000,
+        ),
         ollama_options=ollama_options,
         ollama_keep_alive=_optional(values, "OLLAMA_KEEP_ALIVE", default="5m"),
         ollama_timeout_seconds=_parse_float(values, "OLLAMA_TIMEOUT_SECONDS", default=120.0),
@@ -211,6 +257,18 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         raise ValueError("BOT_AUTONOMOUS_REPLY_LATEST_COUNT must be greater than 0.")
     if not 0 <= settings.bot_autonomous_reply_min_confidence <= 1:
         raise ValueError("BOT_AUTONOMOUS_REPLY_MIN_CONFIDENCE must be between 0 and 1.")
+    if settings.bot_roblox_docs_timeout_seconds <= 0:
+        raise ValueError("BOT_ROBLOX_DOCS_TIMEOUT_SECONDS must be greater than 0.")
+    if settings.bot_roblox_docs_source not in {"auto", "local", "remote"}:
+        raise ValueError("BOT_ROBLOX_DOCS_SOURCE must be 'auto', 'local', or 'remote'.")
+    if settings.bot_roblox_docs_cache_ttl_seconds <= 0:
+        raise ValueError("BOT_ROBLOX_DOCS_CACHE_TTL must be greater than 0.")
+    if settings.bot_roblox_docs_max_terms <= 0:
+        raise ValueError("BOT_ROBLOX_DOCS_MAX_TERMS must be greater than 0.")
+    if settings.bot_roblox_docs_max_results <= 0:
+        raise ValueError("BOT_ROBLOX_DOCS_MAX_RESULTS must be greater than 0.")
+    if settings.bot_roblox_docs_max_context_chars <= 0:
+        raise ValueError("BOT_ROBLOX_DOCS_MAX_CONTEXT_CHARS must be greater than 0.")
     if settings.ollama_timeout_seconds <= 0:
         raise ValueError("OLLAMA_TIMEOUT_SECONDS must be greater than 0.")
     return settings

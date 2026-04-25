@@ -202,6 +202,10 @@ class FakeDiscourseClient:
             return {"topic_id": 100, "post_id": 901, "post_number": 2}
         if "/t/" in post_url and post_url.endswith("/2"):
             return {"topic_id": 100, "post_id": None, "post_number": 2}
+        if post_url == "https://forum.example.com/t/latest-support-question/300/1":
+            return {"topic_id": 300, "post_id": None, "post_number": 1}
+        if post_url == "https://forum.example.com/t/allowed-followup-question/301/1":
+            return {"topic_id": 301, "post_id": None, "post_number": 1}
         raise ValueError("unsupported post url")
 
     def create_post(self, **kwargs: object) -> dict[str, object]:
@@ -223,9 +227,9 @@ class FakeDiscourseClient:
 class FakeOllamaClient:
     def __init__(
         self,
-        decisions: list[ModelDecision],
+        decisions: list[ModelDecision | Exception],
         *,
-        autonomous_selections: list[AutonomousSelection] | None = None,
+        autonomous_selections: list[AutonomousSelection | Exception] | None = None,
     ) -> None:
         self.decisions = decisions
         self.autonomous_selections = autonomous_selections or []
@@ -233,19 +237,50 @@ class FakeOllamaClient:
 
     def decide(self, **kwargs: object) -> ModelDecision:
         self.calls.append(kwargs)
-        return self.decisions.pop(0)
+        decision = self.decisions.pop(0)
+        if isinstance(decision, Exception):
+            raise decision
+        return decision
 
     def compose_manual_reply(self, **kwargs: object) -> ModelDecision:
         self.calls.append(kwargs)
-        return self.decisions.pop(0)
+        decision = self.decisions.pop(0)
+        if isinstance(decision, Exception):
+            raise decision
+        return decision
 
     def compose_autonomous_reply(self, **kwargs: object) -> ModelDecision:
         self.calls.append(kwargs)
-        return self.decisions.pop(0)
+        decision = self.decisions.pop(0)
+        if isinstance(decision, Exception):
+            raise decision
+        return decision
 
     def select_autonomous_reply_target(self, **kwargs: object) -> AutonomousSelection:
         self.calls.append(kwargs)
-        return self.autonomous_selections.pop(0)
+        selection = self.autonomous_selections.pop(0)
+        if isinstance(selection, Exception):
+            raise selection
+        return selection
+
+
+class FakeDocsContext:
+    def __init__(self, content: str) -> None:
+        self.content = content
+
+    def format_for_prompt(self, *, max_chars: int) -> str:
+        return self.content[:max_chars]
+
+
+class FakeRobloxDocsClient:
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+
+    def context_for_text(self, text: str) -> FakeDocsContext | None:
+        self.queries.append(text)
+        if "Part.Shape" not in text:
+            return None
+        return FakeDocsContext("Verified Roblox API docs context:\n- class: Part\n  Relevant members:\n    - Part.Shape")
 
 
 class FailingPresenceAdapter(NullPresenceAdapter):
@@ -329,6 +364,29 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(discourse.mark_read_calls, [1])
             self.assertTrue(storage.is_handled(1))
 
+    def test_notification_decision_failure_is_warning_and_not_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
+            discourse = FakeDiscourseClient([make_notification(15, 1, 100, 2)])
+            ollama = FakeOllamaClient([RuntimeError("decision timed out twice")])
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(str(Path(temp_dir) / "bot.sqlite3")),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            with self.assertLogs(service.logger, level="WARNING") as logs:
+                service.run_once()
+
+            self.assertEqual(discourse.created_posts, [])
+            self.assertFalse(storage.is_handled(15))
+            self.assertTrue(any("Failed to evaluate notification 15" in line for line in logs.output))
+            self.assertFalse(any(line.startswith("ERROR") for line in logs.output))
+
     def test_skip_marks_notification_handled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
@@ -349,6 +407,58 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(discourse.created_posts, [])
             self.assertEqual(discourse.mark_read_calls, [2])
             self.assertTrue(storage.is_handled(2))
+
+    def test_roblox_docs_context_is_attached_for_coding_questions(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
+            discourse = FakeDiscourseClient([make_notification(13, 1, 100, 2)])
+            discourse.topics[100]["post_stream"]["posts"][1]["cooked"] = (
+                "<p>In Luau, is <code>Part.Shape</code> an Enum.PartType?</p>"
+            )
+            ollama = FakeOllamaClient([ModelDecision("skip", "", "Docs answer not needed")])
+            docs = FakeRobloxDocsClient()
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(Path(temp_dir) / "bot.sqlite3"),
+                    bot_roblox_docs_enabled=True,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+                roblox_docs_client=docs,
+            )
+
+            service.run_once()
+
+            self.assertEqual(len(docs.queries), 1)
+            self.assertIn("Part.Shape", docs.queries[0])
+            self.assertIn("roblox_docs_context", ollama.calls[0])
+            self.assertIn("Verified Roblox API docs context", ollama.calls[0]["roblox_docs_context"])
+
+    def test_roblox_docs_context_is_not_attached_when_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
+            discourse = FakeDiscourseClient([make_notification(14, 1, 100, 2)])
+            discourse.topics[100]["post_stream"]["posts"][1]["cooked"] = (
+                "<p>In Luau, is <code>Part.Shape</code> an Enum.PartType?</p>"
+            )
+            ollama = FakeOllamaClient([ModelDecision("skip", "", "No docs")])
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(str(Path(temp_dir) / "bot.sqlite3")),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            self.assertIsNone(ollama.calls[0]["roblox_docs_context"])
 
     def test_private_message_replies_into_topic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -590,14 +700,14 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(discourse.created_posts[0]["reply_to_post_number"], 2)
 
-    def test_autonomous_reply_scan_queues_manual_command_for_selected_latest_post(self) -> None:
+    def test_autonomous_reply_scan_generates_reply_for_selected_latest_post(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "bot.sqlite3"
             storage = BotStorage(database_path)
             discourse = FakeDiscourseClient([])
             selected_url = "https://forum.example.com/t/latest-support-question/300/1"
             ollama = FakeOllamaClient(
-                [],
+                [ModelDecision("reply", "The supported path is to configure it here.", "Autonomous reply")],
                 autonomous_selections=[
                     AutonomousSelection("reply", selected_url, 0.91, "Clear unanswered setup question")
                 ],
@@ -622,13 +732,13 @@ class ServiceTests(unittest.TestCase):
 
             commands = storage.list_manual_commands()
             self.assertEqual(len(commands), 1)
-            self.assertEqual(commands[0].status, "queued")
+            self.assertEqual(commands[0].status, "completed")
             self.assertEqual(commands[0].post_url, selected_url)
             self.assertIn("Clear unanswered setup question", commands[0].user_request)
             self.assertTrue(commands[0].user_request.startswith("AUTONOMOUS_REPLY_SELECTION:"))
             stats = storage.stats_summary()
             self.assertEqual(stats["autonomous_queued"], 1)
-            self.assertEqual(discourse.created_posts, [])
+            self.assertEqual(discourse.created_posts[0]["raw"], "The supported path is to configure it here.")
 
     def test_autonomous_reply_command_uses_autonomous_composer(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -656,6 +766,85 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(discourse.created_posts[0]["raw"], "That is not how this works.")
             self.assertIn("selection_reason", ollama.calls[0])
             self.assertNotIn("user_request", ollama.calls[0])
+
+    def test_autonomous_reply_selection_failure_forces_first_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([])
+            selected_url = "https://forum.example.com/t/latest-support-question/300/1"
+            ollama = FakeOllamaClient(
+                [ModelDecision("reply", "Forced fallback reply.", "Autonomous reply")],
+                autonomous_selections=[
+                    RuntimeError("thinking never finished"),
+                ],
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_interval_seconds=60,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            commands = storage.list_manual_commands()
+            self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0].status, "completed")
+            self.assertEqual(commands[0].post_url, selected_url)
+            self.assertIn("forcing a reply", commands[0].user_request)
+            autonomous_calls = [call for call in ollama.calls if "candidates" in call]
+            self.assertEqual(len(autonomous_calls), 1)
+            self.assertEqual(discourse.created_posts[0]["raw"], "Forced fallback reply.")
+
+    def test_autonomous_reply_generation_retries_until_reply_is_scheduled(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([])
+            selected_url = "https://forum.example.com/t/latest-support-question/300/1"
+            ollama = FakeOllamaClient(
+                [
+                    RuntimeError("autonomous composer timed out"),
+                    ModelDecision("reply", "Generated on retry.", "Autonomous reply"),
+                ],
+                autonomous_selections=[
+                    AutonomousSelection("reply", selected_url, 0.91, "Good place to answer")
+                ],
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_interval_seconds=60,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+            commands = storage.list_manual_commands()
+            self.assertEqual(commands[0].status, "queued")
+            self.assertEqual(commands[0].attempts, 1)
+            self.assertEqual(discourse.created_posts, [])
+
+            clock.advance(31)
+            service.run_once()
+
+            commands = storage.list_manual_commands()
+            self.assertEqual(commands[0].status, "completed")
+            self.assertEqual(discourse.created_posts[0]["raw"], "Generated on retry.")
 
     def test_autonomous_reply_scan_skips_post_with_pending_notification_reply(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -771,7 +960,7 @@ class ServiceTests(unittest.TestCase):
             }
             selected_url = "https://forum.example.com/t/allowed-followup-question/301/1"
             ollama = FakeOllamaClient(
-                [],
+                [ModelDecision("reply", "Use the supported path.", "Autonomous reply")],
                 autonomous_selections=[
                     AutonomousSelection("reply", selected_url, 0.9, "Allowed category question")
                 ],
@@ -797,7 +986,9 @@ class ServiceTests(unittest.TestCase):
 
             commands = storage.list_manual_commands()
             self.assertEqual(len(commands), 1)
+            self.assertEqual(commands[0].status, "completed")
             self.assertEqual(commands[0].post_url, selected_url)
+            self.assertEqual(discourse.created_posts[0]["raw"], "Use the supported path.")
             autonomous_calls = [call for call in ollama.calls if "candidates" in call]
             self.assertEqual(len(autonomous_calls[0]["candidates"]), 1)
             self.assertEqual(autonomous_calls[0]["candidates"][0].topic_id, 301)

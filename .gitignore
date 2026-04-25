@@ -10,3 +10,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
+
+# Local sparse checkout of Roblox Creator Docs used by BOT_ROBLOX_DOCS_LOCAL_PATH
+vendor/creator-docs/

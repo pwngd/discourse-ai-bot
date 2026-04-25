@@ -100,3 +100,65 @@ class ContextResolverTests(unittest.TestCase):
         self.assertEqual(context.target_post.post_number, 4)
         self.assertEqual(discourse.topic_posts_calls, [[103, 105]])
 
+    def test_resolve_topic_centers_context_around_target_post(self) -> None:
+        class FakeDiscourse:
+            def __init__(self) -> None:
+                self.topic_posts_calls: list[list[int]] = []
+
+            def get_topic(self, topic_id: int, *, post_number: int | None = None) -> dict[str, object]:
+                posts = [
+                    {
+                        "id": post_id,
+                        "topic_id": topic_id,
+                        "post_number": post_number,
+                        "username": f"user{post_number}",
+                        "cooked": f"<p>post {post_number}</p>",
+                    }
+                    for post_number, post_id in enumerate(range(201, 211), start=1)
+                ]
+                if post_number is not None:
+                    return {"post_stream": {"posts": [posts[post_number - 1]]}}
+                return {
+                    "title": "Long topic",
+                    "slug": "long-topic",
+                    "post_stream": {
+                        "stream": [post["id"] for post in posts],
+                        "posts": posts[:2],
+                    },
+                }
+
+            def get_topic_posts(self, topic_id: int, post_ids: list[int]) -> dict[str, object]:
+                self.topic_posts_calls.append(list(post_ids))
+                return {
+                    "post_stream": {
+                        "posts": [
+                            {
+                                "id": post_id,
+                                "topic_id": topic_id,
+                                "post_number": post_id - 200,
+                                "username": f"user{post_id - 200}",
+                                "cooked": f"<p>post {post_id - 200}</p>",
+                            }
+                            for post_id in post_ids
+                        ]
+                    }
+                }
+
+            def get_post(self, post_id: int) -> dict[str, object]:
+                raise AssertionError(f"Unexpected per-post fallback for {post_id}")
+
+        discourse = FakeDiscourse()
+        resolver = ContextResolver(discourse, max_posts=5)
+
+        context = resolver.resolve_topic(
+            notification_id=2,
+            trigger="replied",
+            actor_username="user6",
+            topic_id=600,
+            post_number=6,
+        )
+
+        self.assertEqual([post.post_number for post in context.recent_posts], [4, 5, 6, 7, 8])
+        self.assertIsNotNone(context.target_post)
+        self.assertEqual(context.target_post.post_number, 6)
+        self.assertEqual(discourse.topic_posts_calls, [[204, 205, 207, 208]])

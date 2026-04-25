@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import time
 from typing import Any, Callable
 from urllib.parse import urlsplit
 
@@ -116,7 +117,27 @@ The previous response was not valid JSON for the required schema.
 Return only one JSON object. Do not wrap it in Markdown, prose, code fences, or extra text.
 """.strip()
 
+DECISION_RETRY_PROMPT = """
+The previous notification decision attempt got stuck or failed.
+Stop thinking. Force a reply to the target post now.
+Return only one JSON object matching the schema.
+Use action="reply" and put only the final Discourse post body in reply_markdown.
+Do not include prose, Markdown code fences, or any text outside the JSON object.
+""".strip()
+
+AUTONOMOUS_REPLY_RETRY_PROMPT = """
+The previous autonomous reply attempt got stuck or failed.
+Stop thinking. Write the forum reply now.
+Return only one JSON object matching the schema.
+Use action="reply" and put only the final Discourse post body in reply_markdown.
+Do not include prose, Markdown code fences, or any text outside the JSON object.
+""".strip()
+
 STRUCTURED_RESPONSE_ATTEMPTS = 2
+SELECTION_NUM_PREDICT_LIMIT = 256
+REPLY_NUM_PREDICT_LIMIT = 768
+AUTONOMOUS_SELECTION_RECENT_POST_LIMIT = 3
+AUTONOMOUS_SELECTION_POST_TEXT_LIMIT = 700
 
 THINKING_CAPABILITY = "thinking"
 GPT_OSS_THINK_LEVEL = "medium"
@@ -141,8 +162,22 @@ class ThinkingEvent:
 
 
 class OllamaClient:
-    def __init__(self, host: str, *, timeout_seconds: float = 120.0) -> None:
+    def __init__(
+        self,
+        host: str,
+        *,
+        timeout_seconds: float = 120.0,
+        thinking_response_timeout_seconds: float | None = None,
+        monotonic_fn: Callable[[], float] = time.monotonic,
+    ) -> None:
         self.http = JsonHttpClient(_normalize_ollama_host(host), timeout_seconds=timeout_seconds)
+        self.timeout_seconds = timeout_seconds
+        self.thinking_response_timeout_seconds = (
+            thinking_response_timeout_seconds
+            if thinking_response_timeout_seconds is not None
+            else timeout_seconds
+        )
+        self._monotonic = monotonic_fn
         self._model_details_cache: dict[str, dict[str, Any]] = {}
         self._thinking_capability_cache: dict[str, bool] = {}
         self._thinking_callback: Callable[[ThinkingEvent], None] | None = None
@@ -225,6 +260,7 @@ class OllamaClient:
         identity: BotIdentity,
         context: TopicContext,
         available_gifs: list[GifOption] | None = None,
+        roblox_docs_context: str | None = None,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
     ) -> ModelDecision:
@@ -236,9 +272,16 @@ class OllamaClient:
                     "role": "system",
                     "content": f"{system_prompt.strip()}\n\n{INTERNAL_POLICY}",
                 },
+                *_build_context_messages(identity, context, available_gifs),
+                *_build_optional_docs_context_messages(roblox_docs_context),
                 {
                     "role": "user",
-                    "content": _build_context_prompt(identity, context, available_gifs),
+                    "content": "\n".join(
+                        [
+                            "Decide whether the bot should reply to the target post.",
+                            "If replying, produce only the bot's post body as Markdown in reply_markdown.",
+                        ]
+                    ),
                 },
             ],
         }
@@ -251,6 +294,7 @@ class OllamaClient:
             operation="decision",
             payload=payload,
             parser=self._parse_decision,
+            retry_payload_builder=_decision_retry_payload,
         )
 
     def compose_manual_reply(
@@ -262,6 +306,7 @@ class OllamaClient:
         context: TopicContext,
         user_request: str,
         available_gifs: list[GifOption] | None = None,
+        roblox_docs_context: str | None = None,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
     ) -> ModelDecision:
@@ -273,9 +318,11 @@ class OllamaClient:
                     "role": "system",
                     "content": f"{system_prompt.strip()}\n\n{MANUAL_REPLY_POLICY}",
                 },
+                *_build_context_messages(identity, context, available_gifs),
+                *_build_optional_docs_context_messages(roblox_docs_context),
                 {
                     "role": "user",
-                    "content": _build_manual_request_prompt(identity, context, user_request, available_gifs),
+                    "content": _build_manual_request_instruction(user_request),
                 },
             ],
         }
@@ -302,6 +349,7 @@ class OllamaClient:
         context: TopicContext,
         selection_reason: str,
         available_gifs: list[GifOption] | None = None,
+        roblox_docs_context: str | None = None,
         options: dict[str, Any] | None = None,
         keep_alive: str | None = None,
     ) -> ModelDecision:
@@ -313,14 +361,11 @@ class OllamaClient:
                     "role": "system",
                     "content": f"{system_prompt.strip()}\n\n{AUTONOMOUS_REPLY_POLICY}",
                 },
+                *_build_context_messages(identity, context, available_gifs),
+                *_build_optional_docs_context_messages(roblox_docs_context),
                 {
                     "role": "user",
-                    "content": _build_autonomous_reply_prompt(
-                        identity,
-                        context,
-                        selection_reason,
-                        available_gifs,
-                    ),
+                    "content": _build_autonomous_reply_instruction(selection_reason),
                 },
             ],
         }
@@ -333,6 +378,7 @@ class OllamaClient:
             operation="autonomous_reply",
             payload=payload,
             parser=self._parse_decision,
+            retry_payload_builder=_autonomous_reply_retry_payload,
         )
         if decision.action != "reply":
             raise OllamaResponseError("Autonomous reply generation must return action='reply'.")
@@ -376,6 +422,7 @@ class OllamaClient:
             operation="autonomous_selection",
             payload=payload,
             parser=self._parse_autonomous_selection,
+            attempts=1,
         )
 
     def chat(
@@ -538,25 +585,37 @@ class OllamaClient:
         operation: str,
         payload: dict[str, Any],
         parser: Callable[[str], Any],
+        retry_payload_builder: Callable[[dict[str, Any], str, str | None], dict[str, Any]] | None = None,
+        attempts: int = STRUCTURED_RESPONSE_ATTEMPTS,
     ) -> Any:
         attempt_payload = payload
         last_error: OllamaResponseError | None = None
-        for attempt in range(STRUCTURED_RESPONSE_ATTEMPTS):
-            content = self._stream_chat_response(
-                operation=operation if attempt == 0 else f"{operation}_retry",
-                payload=attempt_payload,
-            )
+        for attempt in range(attempts):
+            try:
+                content = self._stream_chat_response(
+                    operation=operation if attempt == 0 else f"{operation}_retry",
+                    payload=attempt_payload,
+                )
+            except OllamaResponseError as exc:
+                last_error = exc
+                if attempt >= attempts - 1 or retry_payload_builder is None:
+                    break
+                attempt_payload = retry_payload_builder(payload, str(exc), None)
+                continue
             try:
                 return parser(content)
             except OllamaResponseError as exc:
                 last_error = exc
-                if attempt >= STRUCTURED_RESPONSE_ATTEMPTS - 1:
+                if attempt >= attempts - 1:
                     break
-                attempt_payload = _structured_retry_payload(
-                    payload,
-                    invalid_content=content,
-                    error=str(exc),
-                )
+                if retry_payload_builder is not None:
+                    attempt_payload = retry_payload_builder(payload, str(exc), content)
+                else:
+                    attempt_payload = _structured_retry_payload(
+                        payload,
+                        invalid_content=content,
+                        error=str(exc),
+                    )
         assert last_error is not None
         raise last_error
 
@@ -596,16 +655,35 @@ class OllamaClient:
         on_thinking_chunk: Callable[[str], None] | None = None,
     ) -> str:
         model = str(payload.get("model", ""))
-        stream_payload = dict(payload)
+        disable_thinking = bool(payload.get("_disable_thinking"))
+        stream_payload = {
+            key: value
+            for key, value in payload.items()
+            if not key.startswith("_")
+        }
         stream_payload["stream"] = True
-        think_setting = self._thinking_setting_for_model(model)
-        if think_setting is not None:
-            stream_payload["think"] = think_setting
+        if disable_thinking:
+            if self.supports_thinking(model):
+                stream_payload["think"] = False
+        else:
+            think_setting = self._thinking_setting_for_model(model)
+            if think_setting is not None:
+                stream_payload["think"] = think_setting
 
         parts: list[str] = []
         thinking_started = False
+        started_at = self._monotonic()
         try:
             for event in self.http.stream_json_lines("POST", "/chat", json_body=stream_payload):
+                elapsed = self._monotonic() - started_at
+                if elapsed > self.timeout_seconds:
+                    raise OllamaResponseError(
+                        f"Ollama {operation} stream exceeded {self.timeout_seconds:.0f}s without completing."
+                    )
+                if thinking_started and not parts and elapsed > self.thinking_response_timeout_seconds:
+                    raise OllamaResponseError(
+                        f"Ollama {operation} stream spent {self.thinking_response_timeout_seconds:.0f}s thinking without response content."
+                    )
                 if not isinstance(event, dict):
                     raise OllamaResponseError("Ollama returned a non-object stream event.")
                 message = event.get("message")
@@ -638,6 +716,8 @@ class OllamaClient:
                 parts.append(chunk)
                 if on_chunk is not None:
                     on_chunk(chunk)
+        except HttpRequestError as exc:
+            raise OllamaResponseError(f"Ollama {operation} stream failed: {exc}") from exc
         finally:
             if thinking_started:
                 self._emit_thinking_event(kind="end", operation=operation, model=model)
@@ -708,8 +788,107 @@ def _structured_retry_payload(
     return retry_payload
 
 
+def _structured_options(
+    options: dict[str, Any] | None,
+    *,
+    num_predict_limit: int,
+) -> dict[str, Any]:
+    structured_options = dict(options or {})
+    structured_options.setdefault("temperature", 0)
+    configured_num_predict = _optional_int_option(structured_options.get("num_predict"))
+    if (
+        configured_num_predict is None
+        or configured_num_predict <= 0
+        or configured_num_predict > num_predict_limit
+    ):
+        structured_options["num_predict"] = num_predict_limit
+    return structured_options
+
+
+def _optional_int_option(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _decision_retry_payload(
+    payload: dict[str, Any],
+    error: str,
+    invalid_content: str | None,
+) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    messages = list(payload.get("messages", []))
+    retry_lines = [
+        DECISION_RETRY_PROMPT,
+        f"Previous failure: {error}",
+    ]
+    if invalid_content:
+        retry_lines.extend(
+            [
+                "Invalid response:",
+                _preview_invalid_response(invalid_content, limit=1000),
+            ]
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": "\n".join(retry_lines),
+        }
+    )
+    retry_payload["messages"] = messages
+    retry_payload["options"] = _structured_options(
+        retry_payload.get("options") if isinstance(retry_payload.get("options"), dict) else None,
+        num_predict_limit=REPLY_NUM_PREDICT_LIMIT,
+    )
+    retry_payload["_disable_thinking"] = True
+    return retry_payload
+
+
+def _autonomous_reply_retry_payload(
+    payload: dict[str, Any],
+    error: str,
+    invalid_content: str | None,
+) -> dict[str, Any]:
+    retry_payload = dict(payload)
+    messages = list(payload.get("messages", []))
+    retry_lines = [
+        AUTONOMOUS_REPLY_RETRY_PROMPT,
+        f"Previous failure: {error}",
+    ]
+    if invalid_content:
+        retry_lines.extend(
+            [
+                "Invalid response:",
+                _preview_invalid_response(invalid_content, limit=1000),
+            ]
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": "\n".join(retry_lines),
+        }
+    )
+    retry_payload["messages"] = messages
+    retry_payload["options"] = _structured_options(
+        retry_payload.get("options") if isinstance(retry_payload.get("options"), dict) else None,
+        num_predict_limit=REPLY_NUM_PREDICT_LIMIT,
+    )
+    retry_payload["_disable_thinking"] = True
+    return retry_payload
+
+
 def _preview_invalid_response(content: str, *, limit: int = 500) -> str:
     normalized = content.strip().replace("\r", "\\r").replace("\n", "\\n")
+    if len(normalized) <= limit:
+        return normalized
+    return f"{normalized[:limit]}...<truncated>"
+
+
+def _truncate_prompt_text(content: str, limit: int) -> str:
+    normalized = " ".join(content.split())
     if len(normalized) <= limit:
         return normalized
     return f"{normalized[:limit]}...<truncated>"
@@ -720,26 +899,93 @@ def _build_context_prompt(
     context: TopicContext,
     available_gifs: list[GifOption] | None = None,
 ) -> str:
-    recent_posts = "\n\n".join(_format_post(post) for post in context.recent_posts)
-    target_section = _format_target_post(context.target_post)
+    messages = _build_context_messages(identity, context, available_gifs)
+    return "\n\n".join(
+        f"{message['role'].upper()} MESSAGE:\n{message['content']}"
+        for message in messages
+    )
+
+
+def _build_context_messages(
+    identity: BotIdentity,
+    context: TopicContext,
+    available_gifs: list[GifOption] | None = None,
+) -> list[dict[str, str]]:
+    target_section = _format_target_summary(context.target_post)
+    messages = [
+        {
+            "role": "user",
+            "content": "\n".join(
+                [
+                    f"Bot username: {identity.username}",
+                    f"Bot display name: {identity.name or ''}",
+                    f"Trigger: {context.trigger}",
+                    f"Actor username: {context.actor_username or ''}",
+                    f"Topic title: {context.topic_title}",
+                    f"Topic id: {context.topic_id}",
+                    f"Topic archetype: {context.topic_archetype or ''}",
+                    target_section,
+                    "",
+                    "The topic transcript follows as chat messages in chronological order.",
+                    "Each message is one Discourse post. Assistant-role messages are the bot's own earlier posts in this topic.",
+                    "Use the transcript to avoid acting unaware of earlier discussion or earlier bot replies.",
+                ]
+            ),
+        }
+    ]
+    if context.recent_posts:
+        messages.extend(_format_post_message(identity, post) for post in context.recent_posts)
+    else:
+        messages.append(
+            {
+                "role": "user",
+                "content": "Topic transcript: (no posts available)",
+            }
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": _format_gif_options(available_gifs),
+        }
+    )
+    return messages
+
+
+def _build_optional_docs_context_messages(
+    roblox_docs_context: str | None,
+) -> list[dict[str, str]]:
+    if not roblox_docs_context or not roblox_docs_context.strip():
+        return []
+    return [
+        {
+            "role": "user",
+            "content": roblox_docs_context.strip(),
+        }
+    ]
+
+
+def _build_context_prompt_with_instruction(
+    identity: BotIdentity,
+    context: TopicContext,
+    instruction: str,
+    available_gifs: list[GifOption] | None = None,
+) -> str:
+    base_prompt = _build_context_prompt(identity, context, available_gifs)
     return "\n".join(
         [
-            f"Bot username: {identity.username}",
-            f"Bot display name: {identity.name or ''}",
-            f"Trigger: {context.trigger}",
-            f"Actor username: {context.actor_username or ''}",
-            f"Topic title: {context.topic_title}",
-            f"Topic id: {context.topic_id}",
-            f"Topic archetype: {context.topic_archetype or ''}",
-            target_section,
-            "Recent conversation:",
-            recent_posts or "(no recent posts available)",
+            base_prompt,
             "",
-            _format_gif_options(available_gifs),
-            "",
-            "Decide whether the bot should reply.",
-            "If replying, produce only the bot's post body as Markdown.",
+            instruction,
         ]
+    )
+
+
+def _format_target_summary(post: TopicPost | None) -> str:
+    if post is None:
+        return "Target post: (not available)"
+    return (
+        f"Target post number: {post.post_number}\n"
+        f"Target post author: {post.username}"
     )
 
 
@@ -749,16 +995,34 @@ def _format_target_post(post: TopicPost | None) -> str:
     return (
         f"Target post number: {post.post_number}\n"
         f"Target post author: {post.username}\n"
-        f"Target post text: {strip_html(post.cooked) or post.raw or ''}"
+        f"Target post text: {_post_text(post)}"
     )
 
 
 def _format_post(post: TopicPost) -> str:
-    text = post.raw or strip_html(post.cooked)
+    text = _post_text(post)
     return (
         f"Post #{post.post_number} by {post.username}"
         f"{f' at {post.created_at}' if post.created_at else ''}:\n{text}"
     )
+
+
+def _format_post_message(identity: BotIdentity, post: TopicPost) -> dict[str, str]:
+    is_bot_post = _same_username(post.username, identity.username)
+    author_label = "your earlier forum post" if is_bot_post else f"forum post by {post.username}"
+    content = (
+        f"Post #{post.post_number}, {author_label}"
+        f"{f' at {post.created_at}' if post.created_at else ''}:\n"
+        f"{_post_text(post)}"
+    )
+    return {
+        "role": "assistant" if is_bot_post else "user",
+        "content": content,
+    }
+
+
+def _post_text(post: TopicPost) -> str:
+    return post.raw or strip_html(post.cooked) or ""
 
 
 def _build_manual_request_prompt(
@@ -767,6 +1031,15 @@ def _build_manual_request_prompt(
     user_request: str,
     available_gifs: list[GifOption] | None = None,
 ) -> str:
+    return _build_context_prompt_with_instruction(
+        identity,
+        context,
+        _build_manual_request_instruction(user_request),
+        available_gifs,
+    )
+
+
+def _build_manual_request_instruction(user_request: str) -> str:
     gif_expectation = (
         "Operator GIF requirement: required when a fitting GIF is available."
         if _manual_request_mentions_gif(user_request)
@@ -774,8 +1047,6 @@ def _build_manual_request_prompt(
     )
     return "\n".join(
         [
-            _build_context_prompt(identity, context, available_gifs),
-            "",
             f"Operator request: {user_request}",
             gif_expectation,
             "Write the reply requested by the operator.",
@@ -789,10 +1060,17 @@ def _build_autonomous_reply_prompt(
     selection_reason: str,
     available_gifs: list[GifOption] | None = None,
 ) -> str:
+    return _build_context_prompt_with_instruction(
+        identity,
+        context,
+        _build_autonomous_reply_instruction(selection_reason),
+        available_gifs,
+    )
+
+
+def _build_autonomous_reply_instruction(selection_reason: str) -> str:
     return "\n".join(
         [
-            _build_context_prompt(identity, context, available_gifs),
-            "",
             f"Selection reason: {selection_reason}",
             "Write the forum reply now. Keep the system prompt's persona and style intact.",
         ]
@@ -806,6 +1084,12 @@ def _manual_request_mentions_gif(user_request: str) -> bool:
     return any(token in normalized for token in (" gif", "gifs", "gif ", "gif,", "gif.", "gif!", "gif?", "gif-")) or normalized.startswith("gif")
 
 
+def _same_username(left: str | None, right: str | None) -> bool:
+    if left is None or right is None:
+        return False
+    return left.strip().casefold() == right.strip().casefold()
+
+
 def _build_autonomous_selection_prompt(
     identity: BotIdentity,
     candidates: list[AutonomousCandidate],
@@ -814,8 +1098,11 @@ def _build_autonomous_selection_prompt(
     candidate_sections = []
     for index, candidate in enumerate(candidates, start=1):
         context = candidate.context
-        target_section = _format_target_post(context.target_post)
-        recent_posts = "\n\n".join(_format_post(post) for post in context.recent_posts)
+        target_section = _format_selection_target_post(context.target_post)
+        recent_posts = "\n\n".join(
+            _format_selection_recent_post(post)
+            for post in context.recent_posts[-AUTONOMOUS_SELECTION_RECENT_POST_LIMIT:]
+        )
         candidate_sections.append(
             "\n".join(
                 [
@@ -843,6 +1130,24 @@ def _build_autonomous_selection_prompt(
             "The chosen post does not have to be a question; it can be a good opportunity for information, perspective, disagreement, or clarification.",
             "If selecting a post, return its exact Post URL in post_url.",
         ]
+    )
+
+
+def _format_selection_target_post(post: TopicPost | None) -> str:
+    if post is None:
+        return "Target post: (not available)"
+    return (
+        f"Target post number: {post.post_number}\n"
+        f"Target post author: {post.username}\n"
+        f"Target post text: {_truncate_prompt_text(_post_text(post), AUTONOMOUS_SELECTION_POST_TEXT_LIMIT)}"
+    )
+
+
+def _format_selection_recent_post(post: TopicPost) -> str:
+    text = _truncate_prompt_text(_post_text(post), AUTONOMOUS_SELECTION_POST_TEXT_LIMIT)
+    return (
+        f"Post #{post.post_number} by {post.username}"
+        f"{f' at {post.created_at}' if post.created_at else ''}:\n{text}"
     )
 
 

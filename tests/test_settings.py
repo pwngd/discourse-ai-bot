@@ -145,6 +145,36 @@ class SettingsTests(unittest.TestCase):
             ("https://forum.example.com/c/staff/4", "https://forum.example.com/c/private/5"),
         )
 
+    def test_roblox_docs_settings_are_parsed(self) -> None:
+        settings = load_settings(
+            {
+                "DISCOURSE_HOST": "https://forum.example.com",
+                "DISCOURSE_AUTH_MODE": "api_key",
+                "DISCOURSE_TOKEN": "token",
+                "DISCOURSE_USERNAME": "bot",
+                "BOT_OLLAMA_HOST": "http://localhost:11434",
+                "OLLAMA_MODEL": "qwen3",
+                "BOT_ROBLOX_DOCS_ENABLED": "true",
+                "BOT_ROBLOX_DOCS_SOURCE": "local",
+                "BOT_ROBLOX_DOCS_LOCAL_PATH": "vendor/creator-docs",
+                "BOT_ROBLOX_DOCS_REF": "main",
+                "BOT_ROBLOX_DOCS_TIMEOUT_SECONDS": "4",
+                "BOT_ROBLOX_DOCS_CACHE_TTL": "12h",
+                "BOT_ROBLOX_DOCS_MAX_TERMS": "3",
+                "BOT_ROBLOX_DOCS_MAX_RESULTS": "2",
+                "BOT_ROBLOX_DOCS_MAX_CONTEXT_CHARS": "1500",
+            }
+        )
+        self.assertTrue(settings.bot_roblox_docs_enabled)
+        self.assertEqual(settings.bot_roblox_docs_source, "local")
+        self.assertEqual(settings.bot_roblox_docs_local_path, "vendor/creator-docs")
+        self.assertEqual(settings.bot_roblox_docs_ref, "main")
+        self.assertEqual(settings.bot_roblox_docs_timeout_seconds, 4.0)
+        self.assertEqual(settings.bot_roblox_docs_cache_ttl_seconds, 43200.0)
+        self.assertEqual(settings.bot_roblox_docs_max_terms, 3)
+        self.assertEqual(settings.bot_roblox_docs_max_results, 2)
+        self.assertEqual(settings.bot_roblox_docs_max_context_chars, 1500)
+
     def test_session_cookie_mode_is_inferred_from_cookie_string(self) -> None:
         settings = load_settings(
             {
