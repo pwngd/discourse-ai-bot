@@ -261,6 +261,60 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual(decision.action, "reply")
         self.assertEqual(decision.reply_markdown, "On it.")
 
+    def test_compose_manual_reply_accepts_plain_markdown_when_schema_is_ignored(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": "Reply:\nThat is the part you need to fix first."}},
+            {"done": True},
+        ]
+        client.http = transport
+
+        decision = client.compose_manual_reply(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=self.context,
+            user_request="Reply briefly.",
+        )
+
+        self.assertEqual(decision.action, "reply")
+        self.assertEqual(decision.reply_markdown, "That is the part you need to fix first.")
+        self.assertEqual(len(transport.stream_calls), 1)
+
+    def test_compose_manual_reply_accepts_body_only_json_when_action_is_missing(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": '{"reply_markdown":"Use the actual error, not the screenshot."}'}},
+            {"done": True},
+        ]
+        client.http = transport
+
+        decision = client.compose_manual_reply(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            context=self.context,
+            user_request="Reply briefly.",
+        )
+
+        self.assertEqual(decision.reply_markdown, "Use the actual error, not the screenshot.")
+
     def test_compose_manual_reply_includes_optional_roblox_docs_context(self) -> None:
         client = OllamaClient("http://localhost:11434")
         transport = FakeTransport(
@@ -436,6 +490,36 @@ class OllamaTests(unittest.TestCase):
         self.assertIn("Do not write like a support agent", messages[0]["content"])
         self.assertNotIn("operator", messages[0]["content"].lower())
 
+    def test_compose_autonomous_reply_accepts_plain_markdown_when_schema_is_ignored(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        transport.stream_responses[("POST", "/chat")] = [
+            {"message": {"content": "No, that explanation is mixing up two different APIs."}},
+            {"done": True},
+        ]
+        client.http = transport
+
+        decision = client.compose_autonomous_reply(
+            model="qwen3",
+            system_prompt="Post like a blunt forum user.",
+            identity=self.identity,
+            context=self.context,
+            selection_reason="Good place to push back.",
+        )
+
+        self.assertEqual(
+            decision.reply_markdown,
+            "No, that explanation is mixing up two different APIs.",
+        )
+        self.assertEqual(len(transport.stream_calls), 1)
+
     def test_select_autonomous_reply_target_parses_selection(self) -> None:
         client = OllamaClient("http://localhost:11434")
         transport = FakeTransport(
@@ -451,9 +535,8 @@ class OllamaTests(unittest.TestCase):
             {
                 "message": {
                     "content": (
-                        '{"action":"reply","post_url":"'
-                        + post_url
-                        + '","confidence":0.88,"reason":"Good chance to add a grounded opinion"}'
+                        '{"action":"reply","candidate_id":1,'
+                        '"confidence":0.88,"reason":"Good chance to add a grounded opinion"}'
                     )
                 }
             },
@@ -482,10 +565,108 @@ class OllamaTests(unittest.TestCase):
         self.assertEqual(selection.confidence, 0.88)
         method, path, kwargs = transport.stream_calls[0]
         self.assertEqual((method, path), ("POST", "/chat"))
-        self.assertEqual(kwargs["json_body"]["format"]["required"], ["action", "post_url", "confidence", "reason"])
+        self.assertEqual(
+            kwargs["json_body"]["format"]["required"],
+            ["action", "candidate_id", "confidence", "reason"],
+        )
+        self.assertEqual(kwargs["json_body"]["options"]["temperature"], 0)
+        self.assertEqual(kwargs["json_body"]["options"]["num_predict"], 256)
         messages = kwargs["json_body"]["messages"]
         self.assertIn("grounded opinion", messages[0]["content"])
+        self.assertIn(
+            "Do not write, draft, outline, quote, or include any forum reply text",
+            messages[0]["content"],
+        )
+        self.assertNotIn("Prompt", messages[0]["content"])
         self.assertIn("does not have to be a question", messages[1]["content"])
+        self.assertIn("Candidate ID: 1", messages[1]["content"])
+        self.assertIn("do not return it", messages[1]["content"])
+
+    def test_select_autonomous_reply_target_accepts_legacy_markdown_link(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        post_url = "https://forum.example.com/t/question/99/2"
+        transport.stream_responses[("POST", "/chat")] = [
+            {
+                "message": {
+                    "content": (
+                        '{"action":"reply","post_url":"[Candidate 1]('
+                        + post_url
+                        + '?u=bot)","confidence":0.88,"reason":"Legacy URL output"}'
+                    )
+                }
+            },
+            {"done": True},
+        ]
+        client.http = transport
+
+        selection = client.select_autonomous_reply_target(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            candidates=[
+                AutonomousCandidate(
+                    post_url=post_url,
+                    topic_id=99,
+                    post_number=2,
+                    actor_username="alice",
+                    context=self.context,
+                )
+            ],
+            min_confidence=0.75,
+        )
+
+        self.assertEqual(selection.post_url, post_url)
+
+    def test_select_autonomous_reply_target_accepts_numeric_strings(self) -> None:
+        client = OllamaClient("http://localhost:11434")
+        transport = FakeTransport(
+            {
+                ("POST", "/show"): {
+                    "capabilities": ["completion"],
+                    "details": {"family": "llama", "families": ["llama"]},
+                }
+            }
+        )
+        post_url = "https://forum.example.com/t/question/99/2"
+        transport.stream_responses[("POST", "/chat")] = [
+            {
+                "message": {
+                    "content": (
+                        '{"action":"reply","candidate_id":"1",'
+                        '"confidence":"0.88","reason":"Numeric strings"}'
+                    )
+                }
+            },
+            {"done": True},
+        ]
+        client.http = transport
+
+        selection = client.select_autonomous_reply_target(
+            model="qwen3",
+            system_prompt="Prompt",
+            identity=self.identity,
+            candidates=[
+                AutonomousCandidate(
+                    post_url=post_url,
+                    topic_id=99,
+                    post_number=2,
+                    actor_username="alice",
+                    context=self.context,
+                )
+            ],
+            min_confidence=0.75,
+        )
+
+        self.assertEqual(selection.post_url, post_url)
+        self.assertEqual(selection.confidence, 0.88)
 
     def test_autonomous_selection_prompt_is_compact_for_large_candidate_sets(self) -> None:
         long_text = " ".join(f"word{i}" for i in range(300))
@@ -577,7 +758,7 @@ class OllamaTests(unittest.TestCase):
 
         self.assertEqual(len(transport.stream_calls), 1)
         first_payload = transport.stream_calls[0][2]["json_body"]
-        self.assertTrue(first_payload["think"])
+        self.assertIs(first_payload["think"], False)
 
     def test_autonomous_selection_stream_failure_gets_one_chance(self) -> None:
         client = OllamaClient("http://localhost:11434")

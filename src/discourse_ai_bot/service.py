@@ -23,7 +23,14 @@ from discourse_ai_bot.models import (
 )
 from discourse_ai_bot.roblox_docs import RobloxDocsClient, RobloxDocsError
 from discourse_ai_bot.settings import Settings
-from discourse_ai_bot.utils import datetime_to_storage, parse_datetime, strip_html, utc_now
+from discourse_ai_bot.utils import (
+    canonical_post_url,
+    datetime_to_storage,
+    parse_datetime,
+    strip_html,
+    topic_post_key_from_url,
+    utc_now,
+)
 
 
 AUTONOMOUS_LATEST_PAGE_SIZE = 30
@@ -460,10 +467,7 @@ class BotService:
             )
             return
 
-        selected = next(
-            (candidate for candidate in candidates if candidate.post_url == selection.post_url),
-            None,
-        )
+        selected = _find_selected_autonomous_candidate(candidates, selection.post_url)
         if selected is None:
             self._record_activity(
                 f"Autonomous selection returned an unknown post URL: {selection.post_url}",
@@ -1180,6 +1184,20 @@ def _category_is_blocked(
 
 def _topic_post_url(host: str, *, slug: str, topic_id: int, post_number: int) -> str:
     return f"{host.rstrip('/')}/t/{slug}/{topic_id}/{post_number}"
+
+
+def _find_selected_autonomous_candidate(
+    candidates: list[AutonomousCandidate],
+    selected_post_url: str | None,
+) -> AutonomousCandidate | None:
+    selected_canonical = canonical_post_url(selected_post_url)
+    selected_key = topic_post_key_from_url(selected_post_url)
+    for candidate in candidates:
+        if selected_canonical and selected_canonical == canonical_post_url(candidate.post_url):
+            return candidate
+        if selected_key == (candidate.topic_id, candidate.post_number):
+            return candidate
+    return None
 
 
 def _optional_int(value: object) -> int | None:

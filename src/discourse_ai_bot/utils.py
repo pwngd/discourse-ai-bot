@@ -5,6 +5,7 @@ from html import unescape
 from html.parser import HTMLParser
 import re
 from typing import Iterable
+from urllib.parse import urlsplit
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -76,3 +77,47 @@ def parse_duration_seconds(value: str, *, field_name: str) -> float:
     else:
         multiplier = 3600.0
     return amount * multiplier
+
+
+def extract_url_like(value: str) -> str | None:
+    markdown_match = re.search(r"\]\((https?://[^)\s]+)\)", value)
+    if markdown_match:
+        return markdown_match.group(1).rstrip(".,;")
+    raw_match = re.search(r"https?://[^\s<>)\]]+", value)
+    if raw_match:
+        return raw_match.group(0).rstrip(".,;")
+    return None
+
+
+def canonical_post_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    url = extract_url_like(value) or value.strip()
+    if not url:
+        return None
+    parts = urlsplit(url)
+    if parts.scheme not in {"http", "https"} or not parts.netloc:
+        return None
+    path = "/" + "/".join(segment for segment in parts.path.split("/") if segment)
+    return f"{parts.scheme.lower()}://{parts.netloc.lower()}{path}"
+
+
+def topic_post_key_from_url(value: str | None) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    url = extract_url_like(value) or value.strip()
+    path = urlsplit(url).path or url
+    segments = [segment for segment in path.split("/") if segment]
+    try:
+        topic_index = segments.index("t")
+    except ValueError:
+        return None
+    numeric_segments: list[int] = []
+    for segment in segments[topic_index + 1 :]:
+        try:
+            numeric_segments.append(int(segment))
+        except ValueError:
+            continue
+    if len(numeric_segments) < 2:
+        return None
+    return numeric_segments[-2], numeric_segments[-1]

@@ -804,6 +804,40 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(len(autonomous_calls), 1)
             self.assertEqual(discourse.created_posts[0]["raw"], "Forced fallback reply.")
 
+    def test_autonomous_reply_selection_matches_formatted_post_url(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            discourse = FakeDiscourseClient([])
+            selected_url = "https://forum.example.com/t/latest-support-question/300/1"
+            formatted_url = f"[selected]({selected_url}?u=bot)"
+            ollama = FakeOllamaClient(
+                [ModelDecision("reply", "Matched despite formatting.", "Autonomous reply")],
+                autonomous_selections=[
+                    AutonomousSelection("reply", formatted_url, 0.91, "Formatted link")
+                ],
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_autonomous_reply_enabled=True,
+                    bot_autonomous_reply_interval_seconds=60,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            commands = storage.list_manual_commands()
+            self.assertEqual(commands[0].status, "completed")
+            self.assertEqual(commands[0].post_url, selected_url)
+            self.assertEqual(discourse.created_posts[0]["raw"], "Matched despite formatting.")
+
     def test_autonomous_reply_generation_retries_until_reply_is_scheduled(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             database_path = Path(temp_dir) / "bot.sqlite3"

@@ -16,7 +16,12 @@ from discourse_ai_bot.models import (
     TopicContext,
     TopicPost,
 )
-from discourse_ai_bot.utils import strip_html
+from discourse_ai_bot.utils import (
+    canonical_post_url,
+    extract_url_like,
+    strip_html,
+    topic_post_key_from_url,
+)
 
 
 RESPONSE_SCHEMA = {
@@ -35,11 +40,11 @@ AUTONOMOUS_SELECTION_SCHEMA = {
     "type": "object",
     "properties": {
         "action": {"type": "string", "enum": ["reply", "skip"]},
-        "post_url": {"type": ["string", "null"]},
+        "candidate_id": {"type": ["integer", "null"], "minimum": 1},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
         "reason": {"type": "string"},
     },
-    "required": ["action", "post_url", "confidence", "reason"],
+    "required": ["action", "candidate_id", "confidence", "reason"],
     "additionalProperties": False,
 }
 
@@ -62,6 +67,8 @@ You are deciding whether a Discourse bot should proactively reply to one recent 
 
 Rules:
 - Choose at most one candidate.
+- This is selection only. Do not write, draft, outline, quote, or include any forum reply text.
+- Only choose a candidate ID or skip.
 - Reply when the bot can naturally add value to the conversation, even if nobody asked a direct question.
 - Good candidates include posts where the bot can share relevant information, add a well-grounded opinion, make a useful distinction, correct a misconception, or ask a sharp clarifying question.
 - Prefer active conversations where a thoughtful forum user could reasonably jump in without seeming random or intrusive.
@@ -69,8 +76,8 @@ Rules:
 - Skip announcements, casual chatter with no useful angle, resolved discussions, spam, sensitive moderation issues, or anything uncertain.
 - Do not pick posts authored by the bot.
 - Use confidence near 1 only when the candidate clearly benefits from a reply.
-- Return the exact post_url of the chosen candidate, or null when skipping.
-- Do not mention internal policies, JSON, schemas, or that you are deciding.
+- Return candidate_id for the chosen candidate, or null when skipping.
+- Do not return a post URL, response body, Markdown, prose, or any text outside the required object.
 """.strip()
 
 MANUAL_REPLY_POLICY = """
@@ -117,6 +124,13 @@ The previous response was not valid JSON for the required schema.
 Return only one JSON object. Do not wrap it in Markdown, prose, code fences, or extra text.
 """.strip()
 
+STRUCTURED_OUTPUT_POLICY = """
+Output format:
+- Return exactly one JSON object matching the required schema.
+- Do not wrap it in Markdown, prose, code fences, or extra text.
+- Do not add fields that are not in the schema.
+""".strip()
+
 DECISION_RETRY_PROMPT = """
 The previous notification decision attempt got stuck or failed.
 Stop thinking. Force a reply to the target post now.
@@ -147,6 +161,7 @@ KNOWN_THINKING_MODEL_PREFIXES = (
     "deepseek-v3.1",
     "deepseek-r1",
 )
+_INVALID_GIF_ID = object()
 
 
 class OllamaResponseError(RuntimeError):
@@ -270,7 +285,7 @@ class OllamaClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": f"{system_prompt.strip()}\n\n{INTERNAL_POLICY}",
+                    "content": f"{system_prompt.strip()}\n\n{INTERNAL_POLICY}\n\n{STRUCTURED_OUTPUT_POLICY}",
                 },
                 *_build_context_messages(identity, context, available_gifs),
                 *_build_optional_docs_context_messages(roblox_docs_context),
@@ -316,7 +331,7 @@ class OllamaClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": f"{system_prompt.strip()}\n\n{MANUAL_REPLY_POLICY}",
+                    "content": f"{system_prompt.strip()}\n\n{MANUAL_REPLY_POLICY}\n\n{STRUCTURED_OUTPUT_POLICY}",
                 },
                 *_build_context_messages(identity, context, available_gifs),
                 *_build_optional_docs_context_messages(roblox_docs_context),
@@ -334,7 +349,10 @@ class OllamaClient:
         decision = self._stream_and_parse_structured_response(
             operation="manual_reply",
             payload=payload,
-            parser=self._parse_decision,
+            parser=lambda content: _parse_required_reply_decision(
+                content,
+                fallback_reason="Plain reply body accepted for manual request",
+            ),
         )
         if decision.action != "reply":
             raise OllamaResponseError("Manual reply generation must return action='reply'.")
@@ -359,7 +377,7 @@ class OllamaClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": f"{system_prompt.strip()}\n\n{AUTONOMOUS_REPLY_POLICY}",
+                    "content": f"{system_prompt.strip()}\n\n{AUTONOMOUS_REPLY_POLICY}\n\n{STRUCTURED_OUTPUT_POLICY}",
                 },
                 *_build_context_messages(identity, context, available_gifs),
                 *_build_optional_docs_context_messages(roblox_docs_context),
@@ -377,7 +395,10 @@ class OllamaClient:
         decision = self._stream_and_parse_structured_response(
             operation="autonomous_reply",
             payload=payload,
-            parser=self._parse_decision,
+            parser=lambda content: _parse_required_reply_decision(
+                content,
+                fallback_reason="Plain reply body accepted for autonomous reply",
+            ),
             retry_payload_builder=_autonomous_reply_retry_payload,
         )
         if decision.action != "reply":
@@ -401,7 +422,7 @@ class OllamaClient:
             "messages": [
                 {
                     "role": "system",
-                    "content": f"{system_prompt.strip()}\n\n{AUTONOMOUS_SELECTION_POLICY}",
+                    "content": f"{AUTONOMOUS_SELECTION_POLICY}\n\n{STRUCTURED_OUTPUT_POLICY}",
                 },
                 {
                     "role": "user",
@@ -421,7 +442,10 @@ class OllamaClient:
         return self._stream_and_parse_structured_response(
             operation="autonomous_selection",
             payload=payload,
-            parser=self._parse_autonomous_selection,
+            parser=lambda content: self._parse_autonomous_selection(
+                content,
+                candidates=candidates,
+            ),
             attempts=1,
         )
 
@@ -526,17 +550,19 @@ class OllamaClient:
         if not isinstance(payload, dict):
             raise OllamaResponseError("Ollama decision must be a JSON object.")
 
-        action = payload.get("action")
+        action = _normalize_action(payload.get("action"))
         reply_markdown = payload.get("reply_markdown")
         reason = payload.get("reason")
-        gif_id = payload.get("gif_id")
+        gif_id = _normalize_gif_id(payload.get("gif_id"))
         if action not in {"reply", "skip"}:
             raise OllamaResponseError("Ollama action must be 'reply' or 'skip'.")
+        if action == "skip" and reply_markdown is None:
+            reply_markdown = ""
         if not isinstance(reply_markdown, str):
             raise OllamaResponseError("reply_markdown must be a string.")
         if not isinstance(reason, str) or not reason.strip():
-            raise OllamaResponseError("reason must be a non-empty string.")
-        if gif_id is not None and (not isinstance(gif_id, str) or not gif_id.strip()):
+            reason = "No reason provided."
+        if gif_id is _INVALID_GIF_ID:
             raise OllamaResponseError("gif_id must be null or a non-empty string.")
         if action == "reply" and not reply_markdown.strip():
             raise OllamaResponseError("reply_markdown must be non-empty when action is 'reply'.")
@@ -545,36 +571,52 @@ class OllamaClient:
             action=action,
             reply_markdown=reply_markdown.strip(),
             reason=reason.strip(),
-            gif_id=gif_id.strip().lower() if isinstance(gif_id, str) else None,
+            gif_id=gif_id,
         )
 
     @staticmethod
-    def _parse_autonomous_selection(content: str) -> AutonomousSelection:
+    def _parse_autonomous_selection(
+        content: str,
+        candidates: list[AutonomousCandidate] | None = None,
+    ) -> AutonomousSelection:
         payload = _loads_json_object(content)
 
         if not isinstance(payload, dict):
             raise OllamaResponseError("Ollama autonomous selection must be a JSON object.")
 
-        action = payload.get("action")
+        action = _normalize_action(payload.get("action"))
+        raw_candidate_id = payload.get("candidate_id")
+        candidate_id = _coerce_candidate_id(raw_candidate_id)
         post_url = payload.get("post_url")
-        confidence = payload.get("confidence")
+        confidence = _coerce_confidence(payload.get("confidence"))
         reason = payload.get("reason")
         if action not in {"reply", "skip"}:
             raise OllamaResponseError("Ollama autonomous action must be 'reply' or 'skip'.")
+        if raw_candidate_id is not None and candidate_id is None:
+            raise OllamaResponseError("candidate_id must be null or an integer.")
         if post_url is not None and (not isinstance(post_url, str) or not post_url.strip()):
             raise OllamaResponseError("post_url must be null or a non-empty string.")
-        if action == "reply" and not isinstance(post_url, str):
-            raise OllamaResponseError("post_url must be set when action is 'reply'.")
+        if action == "skip" and candidate_id is not None:
+            raise OllamaResponseError("candidate_id must be null when action is 'skip'.")
         if action == "skip" and post_url is not None:
             raise OllamaResponseError("post_url must be null when action is 'skip'.")
-        if not isinstance(confidence, int | float) or not 0 <= float(confidence) <= 1:
+        if confidence is None:
             raise OllamaResponseError("confidence must be a number between 0 and 1.")
         if not isinstance(reason, str) or not reason.strip():
-            raise OllamaResponseError("reason must be a non-empty string.")
+            reason = "No reason provided."
+        resolved_post_url: str | None = None
+        if action == "reply":
+            resolved_post_url = _resolve_selection_post_url(
+                candidate_id=candidate_id,
+                post_url=post_url,
+                candidates=candidates,
+            )
+            if resolved_post_url is None:
+                raise OllamaResponseError("candidate_id must refer to one of the supplied candidates.")
 
         return AutonomousSelection(
             action=action,
-            post_url=post_url.strip() if isinstance(post_url, str) else None,
+            post_url=resolved_post_url,
             confidence=float(confidence),
             reason=reason.strip(),
         )
@@ -588,7 +630,11 @@ class OllamaClient:
         retry_payload_builder: Callable[[dict[str, Any], str, str | None], dict[str, Any]] | None = None,
         attempts: int = STRUCTURED_RESPONSE_ATTEMPTS,
     ) -> Any:
-        attempt_payload = payload
+        attempt_payload = _structured_attempt_payload(
+            payload,
+            operation=operation,
+            is_retry=False,
+        )
         last_error: OllamaResponseError | None = None
         for attempt in range(attempts):
             try:
@@ -600,7 +646,11 @@ class OllamaClient:
                 last_error = exc
                 if attempt >= attempts - 1 or retry_payload_builder is None:
                     break
-                attempt_payload = retry_payload_builder(payload, str(exc), None)
+                attempt_payload = _structured_attempt_payload(
+                    retry_payload_builder(payload, str(exc), None),
+                    operation=operation,
+                    is_retry=True,
+                )
                 continue
             try:
                 return parser(content)
@@ -609,12 +659,20 @@ class OllamaClient:
                 if attempt >= attempts - 1:
                     break
                 if retry_payload_builder is not None:
-                    attempt_payload = retry_payload_builder(payload, str(exc), content)
+                    attempt_payload = _structured_attempt_payload(
+                        retry_payload_builder(payload, str(exc), content),
+                        operation=operation,
+                        is_retry=True,
+                    )
                 else:
-                    attempt_payload = _structured_retry_payload(
-                        payload,
-                        invalid_content=content,
-                        error=str(exc),
+                    attempt_payload = _structured_attempt_payload(
+                        _structured_retry_payload(
+                            payload,
+                            invalid_content=content,
+                            error=str(exc),
+                        ),
+                        operation=operation,
+                        is_retry=True,
                     )
         assert last_error is not None
         raise last_error
@@ -725,6 +783,152 @@ class OllamaClient:
         return "".join(parts).strip()
 
 
+def _parse_required_reply_decision(content: str, *, fallback_reason: str) -> ModelDecision:
+    try:
+        return OllamaClient._parse_decision(content)
+    except OllamaResponseError:
+        payload_decision = _reply_decision_from_partial_payload(
+            content,
+            fallback_reason=fallback_reason,
+        )
+        if payload_decision is not None:
+            return payload_decision
+        reply_body = _plain_reply_body_from_unstructured_content(content)
+        if reply_body is None:
+            raise
+        return ModelDecision(
+            action="reply",
+            reply_markdown=reply_body,
+            reason=fallback_reason,
+        )
+
+
+def _normalize_action(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return value.strip().casefold()
+
+
+def _normalize_gif_id(value: Any) -> str | None | object:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return _INVALID_GIF_ID
+    normalized = value.strip().casefold()
+    if normalized in {"", "null", "none", "no", "false"}:
+        return None
+    return normalized
+
+
+def _coerce_candidate_id(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdecimal():
+            return int(stripped)
+    return None
+
+
+def _coerce_confidence(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= confidence <= 1:
+        return None
+    return confidence
+
+
+def _reply_decision_from_partial_payload(
+    content: str,
+    *,
+    fallback_reason: str,
+) -> ModelDecision | None:
+    try:
+        payload = _loads_json_object(content)
+    except OllamaResponseError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    for key in ("reply_markdown", "raw", "body", "reply"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            gif_id = _normalize_gif_id(payload.get("gif_id"))
+            return ModelDecision(
+                action="reply",
+                reply_markdown=value.strip(),
+                reason=fallback_reason,
+                gif_id=gif_id if gif_id is not _INVALID_GIF_ID else None,
+            )
+    return None
+
+
+def _plain_reply_body_from_unstructured_content(content: str) -> str | None:
+    body = content.strip()
+    if not body:
+        return None
+    if _extract_embedded_json_object(body) is not None:
+        return None
+    if body.lstrip().startswith(("{", "[")):
+        return None
+
+    lines = body.splitlines()
+    if len(lines) > 1:
+        first = lines[0].strip().rstrip(":").casefold()
+        if first in {"reply", "reply markdown", "forum reply", "post body"}:
+            body = "\n".join(lines[1:]).strip()
+
+    lowered = body.casefold()
+    for prefix in ("reply_markdown:", "reply:", "forum reply:", "post body:"):
+        if lowered.startswith(prefix):
+            body = body[len(prefix) :].strip()
+            break
+
+    if not body:
+        return None
+    return body
+
+
+def _resolve_selection_post_url(
+    *,
+    candidate_id: int | None,
+    post_url: str | None,
+    candidates: list[AutonomousCandidate] | None,
+) -> str | None:
+    if candidates:
+        if candidate_id is not None:
+            if 1 <= candidate_id <= len(candidates):
+                return candidates[candidate_id - 1].post_url
+            return None
+        if post_url is not None:
+            return _match_candidate_post_url(post_url, candidates)
+        return None
+
+    if post_url is not None:
+        return extract_url_like(post_url) or post_url.strip()
+    return None
+
+
+def _match_candidate_post_url(
+    selected_post_url: str,
+    candidates: list[AutonomousCandidate],
+) -> str | None:
+    selected_canonical = canonical_post_url(selected_post_url)
+    selected_key = topic_post_key_from_url(selected_post_url)
+    for candidate in candidates:
+        if selected_canonical and selected_canonical == canonical_post_url(candidate.post_url):
+            return candidate.post_url
+        if selected_key == (candidate.topic_id, candidate.post_number):
+            return candidate.post_url
+    return None
+
+
 def _normalize_ollama_host(host: str) -> str:
     clean = host.rstrip("/")
     parts = urlsplit(clean)
@@ -812,6 +1016,29 @@ def _optional_int_option(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _structured_attempt_payload(
+    payload: dict[str, Any],
+    *,
+    operation: str,
+    is_retry: bool,
+) -> dict[str, Any]:
+    attempt_payload = dict(payload)
+    num_predict_limit = (
+        SELECTION_NUM_PREDICT_LIMIT
+        if operation == "autonomous_selection"
+        else REPLY_NUM_PREDICT_LIMIT
+    )
+    attempt_payload["options"] = _structured_options(
+        attempt_payload.get("options")
+        if isinstance(attempt_payload.get("options"), dict)
+        else None,
+        num_predict_limit=num_predict_limit,
+    )
+    if operation == "autonomous_selection" or is_retry:
+        attempt_payload["_disable_thinking"] = True
+    return attempt_payload
 
 
 def _decision_retry_payload(
@@ -1106,8 +1333,8 @@ def _build_autonomous_selection_prompt(
         candidate_sections.append(
             "\n".join(
                 [
-                    f"Candidate {index}",
-                    f"Post URL: {candidate.post_url}",
+                    f"Candidate ID: {index}",
+                    f"Post URL for reference only, do not return it: {candidate.post_url}",
                     f"Topic title: {context.topic_title}",
                     f"Topic id: {candidate.topic_id}",
                     f"Topic archetype: {context.topic_archetype or ''}",
@@ -1128,7 +1355,8 @@ def _build_autonomous_selection_prompt(
             "",
             "Select one post only if confidence meets or exceeds the minimum.",
             "The chosen post does not have to be a question; it can be a good opportunity for information, perspective, disagreement, or clarification.",
-            "If selecting a post, return its exact Post URL in post_url.",
+            "If selecting a post, return only its Candidate ID in candidate_id.",
+            "Do not write the reply. The reply will be written later in a separate step.",
         ]
     )
 
