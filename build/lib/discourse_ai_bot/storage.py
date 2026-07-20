@@ -213,17 +213,6 @@ class BotStorage:
                 (last_presence_at, notification_id),
             )
 
-    def clear_job_gif(self, notification_id: int) -> None:
-        with self._session() as connection:
-            connection.execute(
-                """
-                UPDATE pending_replies
-                SET gif_id = NULL
-                WHERE notification_id = ?
-                """,
-                (notification_id,),
-            )
-
     def reschedule_job(
         self,
         notification_id: int,
@@ -525,17 +514,6 @@ class BotStorage:
                 WHERE command_id = ?
                 """,
                 (last_presence_at, command_id),
-            )
-
-    def clear_manual_command_gif(self, command_id: int) -> None:
-        with self._session() as connection:
-            connection.execute(
-                """
-                UPDATE manual_commands
-                SET gif_id = NULL
-                WHERE command_id = ?
-                """,
-                (command_id,),
             )
 
     def reschedule_manual_command_send(

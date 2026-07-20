@@ -666,7 +666,6 @@ class BotService:
         )
 
     def _prepare_manual_command(self, command: Any, now: Any) -> None:
-        selection_reason = _autonomous_reply_selection_reason(command.user_request)
         try:
             target = self.discourse.resolve_post_url(command.post_url)
             context = self.context_resolver.resolve_topic(
@@ -681,6 +680,7 @@ class BotService:
                 context,
                 extra_text=command.user_request,
             )
+            selection_reason = _autonomous_reply_selection_reason(command.user_request)
             if selection_reason is None:
                 decision = self.ollama.compose_manual_reply(
                     model=self.settings.ollama_model,
@@ -725,13 +725,9 @@ class BotService:
             )
             return
 
-        delay_seconds = (
-            self.randomizer.uniform(
-                self.settings.bot_response_delay_min_seconds,
-                self.settings.bot_response_delay_max_seconds,
-            )
-            if selection_reason is not None
-            else 0.0
+        delay_seconds = self.randomizer.uniform(
+            self.settings.bot_response_delay_min_seconds,
+            self.settings.bot_response_delay_max_seconds,
         )
         due_at = now + timedelta(seconds=delay_seconds)
         presence_channel = None
@@ -752,18 +748,14 @@ class BotService:
             due_at=datetime_to_storage(due_at),
             presence_channel=presence_channel,
         )
-        if selection_reason is None:
-            self._record_activity(f"Queued manual command {command.command_id} for immediate send.")
-            self.logger.info("Queued manual command %s for immediate send.", command.command_id)
-        else:
-            self._record_activity(
-                f"Queued autonomous command {command.command_id} with {delay_seconds:.2f}s delay."
-            )
-            self.logger.info(
-                "Queued autonomous command %s with %.2f second delay.",
-                command.command_id,
-                delay_seconds,
-            )
+        self._record_activity(
+            f"Queued manual command {command.command_id} with {delay_seconds:.2f}s delay."
+        )
+        self.logger.info(
+            "Queued manual command %s with %.2f second delay.",
+            command.command_id,
+            delay_seconds,
+        )
 
     def _process_job(self, job: Any, now: Any) -> None:
         if getattr(self.presence, "enabled", False) and job.presence_channel:
@@ -781,9 +773,7 @@ class BotService:
                 )
 
         try:
-            final_raw, gif_failed = self._build_post_body(job.raw, job.gif_id)
-            if gif_failed:
-                self.storage.clear_job_gif(job.notification_id)
+            final_raw = self._build_post_body(job.raw, job.gif_id)
             response = self.discourse.create_post(
                 raw=final_raw,
                 topic_id=job.topic_id,
@@ -850,9 +840,7 @@ class BotService:
                 )
 
         try:
-            final_raw, gif_failed = self._build_post_body(command.raw or "", command.gif_id)
-            if gif_failed:
-                self.storage.clear_manual_command_gif(command.command_id)
+            final_raw = self._build_post_body(command.raw or "", command.gif_id)
             response = self.discourse.create_post(
                 raw=final_raw,
                 topic_id=command.topic_id,
@@ -918,10 +906,10 @@ class BotService:
     def _backoff_seconds(attempts: int) -> float:
         return min(3600.0, 30.0 * (2 ** max(attempts - 1, 0)))
 
-    def _build_post_body(self, raw: str, gif_id: str | None) -> tuple[str, bool]:
+    def _build_post_body(self, raw: str, gif_id: str | None) -> str:
         base = raw.strip()
         if not gif_id:
-            return base, False
+            return base
 
         option = self.gif_catalog.get(gif_id)
         if option is None:
@@ -930,12 +918,12 @@ class BotService:
                 level="warning",
             )
             self.logger.warning("GIF '%s' was requested but not found. Sending text only.", gif_id)
-            return base, True
+            return base
 
         upload_url = self._upload_gif(option)
         if upload_url is None:
-            return base, True
-        return f"{base}\n\n![{option.alt_text}]({upload_url})".strip(), False
+            return base
+        return f"{base}\n\n![{option.alt_text}]({upload_url})".strip()
 
     def _roblox_docs_context(
         self,
@@ -993,11 +981,11 @@ class BotService:
         upload_reference = self._normalize_upload_reference(response)
         if upload_reference is None:
             self._record_activity(
-                f"Upload response for GIF '{option.gif_id}' did not include a URL. Retrying without the GIF.",
+                f"Upload response for GIF '{option.gif_id}' did not include a URL. Sending text only.",
                 level="warning",
             )
             self.logger.warning(
-                "Upload response for GIF '%s' did not include a usable URL. Retrying without the GIF.",
+                "Upload response for GIF '%s' did not include a usable URL.",
                 option.gif_id,
             )
             return None

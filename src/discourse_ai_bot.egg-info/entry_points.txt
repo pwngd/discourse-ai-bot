@@ -1,0 +1,2 @@
+[console_scripts]
+discourse-ai-bot = discourse_ai_bot.cli:main

@@ -618,6 +618,58 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(len(discourse.upload_calls), 1)
             self.assertIn("![friendly wave](upload://friendly_wave.gif)", discourse.created_posts[0]["raw"])
 
+    def test_broken_gif_upload_is_removed_before_post_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
+
+            class MissingUrlDiscourseClient(FakeDiscourseClient):
+                def upload_file(self, file_path: object, **kwargs: object) -> dict[str, object]:
+                    self.upload_calls.append({"file_path": file_path, **kwargs})
+                    return {"id": 1}
+
+            discourse = MissingUrlDiscourseClient(
+                [make_notification(11, 1, 100, 2)],
+                fail_create_post=True,
+            )
+            ollama = FakeOllamaClient(
+                [ModelDecision("reply", "Thanks for the ping.", "Direct ask", gif_id="friendly_wave")]
+            )
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(str(Path(temp_dir) / "bot.sqlite3")),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                randomizer=random.Random(0),
+                now_fn=clock.now,
+            )
+            gif_path = Path(temp_dir) / "friendly_wave.gif"
+            gif_path.write_bytes(b"GIF89a")
+
+            class FakeCatalog:
+                def list_options(self) -> list[GifOption]:
+                    return [GifOption("friendly_wave", gif_path, "friendly wave")]
+
+                def get(self, gif_id: str | None) -> GifOption | None:
+                    return GifOption("friendly_wave", gif_path, "friendly wave") if gif_id == "friendly_wave" else None
+
+            service.gif_catalog = FakeCatalog()  # type: ignore[assignment]
+
+            service.run_once()
+
+            pending = storage.list_pending_jobs()[0]
+            self.assertIsNone(pending.gif_id)
+            self.assertEqual(len(discourse.upload_calls), 1)
+
+            discourse.fail_create_post = False
+            clock.advance(30)
+            service.run_once()
+
+            self.assertEqual(len(discourse.upload_calls), 1)
+            self.assertEqual(discourse.created_posts[0]["raw"], "Thanks for the ping.")
+            self.assertTrue(storage.is_handled(11))
+
     def test_session_cookie_mode_bootstraps_from_current_session(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = BotStorage(Path(temp_dir) / "bot.sqlite3")
@@ -674,6 +726,36 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(discourse.created_posts[0]["topic_id"], 100)
             self.assertEqual(discourse.created_posts[0]["reply_to_post_number"], 2)
             self.assertEqual(discourse.created_posts[0]["raw"], "We're checking now.")
+
+    def test_manual_ai_command_ignores_configured_reply_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            storage.enqueue_manual_command(
+                post_url="https://forum.example.com/p/901",
+                user_request="Reply immediately.",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+            discourse = FakeDiscourseClient([])
+            ollama = FakeOllamaClient([ModelDecision("reply", "Immediate reply.", "Operator request")])
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_response_delay_min_seconds=30,
+                    bot_response_delay_max_seconds=30,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            self.assertEqual(storage.list_manual_commands()[0].status, "completed")
+            self.assertEqual(discourse.created_posts[0]["raw"], "Immediate reply.")
 
     def test_manual_ai_command_uses_exact_reply_number_from_topic_url(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -766,6 +848,42 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(discourse.created_posts[0]["raw"], "That is not how this works.")
             self.assertIn("selection_reason", ollama.calls[0])
             self.assertNotIn("user_request", ollama.calls[0])
+
+    def test_autonomous_reply_command_keeps_configured_reply_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "bot.sqlite3"
+            storage = BotStorage(database_path)
+            storage.enqueue_manual_command(
+                post_url="https://forum.example.com/t/topic-100/100/2",
+                user_request="AUTONOMOUS_REPLY_SELECTION: Good place to join the thread.",
+                created_at="2026-01-01T00:00:00+00:00",
+            )
+            discourse = FakeDiscourseClient([])
+            ollama = FakeOllamaClient([ModelDecision("reply", "Delayed auto reply.", "Autonomous reply")])
+            clock = FakeClock(datetime(2026, 1, 1, tzinfo=UTC))
+            service = BotService(
+                settings=self.make_settings(
+                    str(database_path),
+                    bot_response_delay_min_seconds=30,
+                    bot_response_delay_max_seconds=30,
+                ),
+                discourse_client=discourse,
+                ollama_client=ollama,
+                storage=storage,
+                presence_adapter=NullPresenceAdapter(),
+                now_fn=clock.now,
+            )
+
+            service.run_once()
+
+            self.assertEqual(storage.list_manual_commands()[0].status, "scheduled")
+            self.assertEqual(discourse.created_posts, [])
+
+            clock.advance(30)
+            service.run_once()
+
+            self.assertEqual(storage.list_manual_commands()[0].status, "completed")
+            self.assertEqual(discourse.created_posts[0]["raw"], "Delayed auto reply.")
 
     def test_autonomous_reply_selection_failure_forces_first_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
